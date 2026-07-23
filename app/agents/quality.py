@@ -1,9 +1,11 @@
 import pandas as pd
 import pandera as pa
 from typing import List
+from langsmith import traceable
 
 from app.agents.schemas import QualityOutput, QualityAnomaly
 
+@traceable
 def run_quality_check(csv_path: str) -> QualityOutput:
     """
     Runs quality checks using Pandera and Pandas heuristics.

@@ -2,9 +2,14 @@ import pandas as pd
 from ydata_profiling import ProfileReport
 import json
 import io
+import logging
+from langsmith import traceable
 
 from app.agents.schemas import ProfilerOutput
 
+logger = logging.getLogger(__name__)
+
+@traceable
 def run_profiler(csv_path: str) -> ProfilerOutput:
     """
     Run the profiler agent on a raw CSV file.

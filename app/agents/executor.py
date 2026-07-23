@@ -3,7 +3,10 @@ import tempfile
 import subprocess
 import json
 from typing import Dict, Any
+from langsmith import traceable
+from app.agents.schemas import ExecutorOutput
 
+@traceable
 def execute_cleaning_code(code_str: str, input_csv_path: str, output_csv_path: str, timeout: int = 60) -> Dict[str, Any]:
     """
     Safely executes LLM generated pandas code in an isolated subprocess.
