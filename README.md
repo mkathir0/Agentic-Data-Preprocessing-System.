@@ -36,7 +36,7 @@ graph TD
         C -->|Write Python + Run Sandbox| D[Validate Node]
         
         D -->|High Severity Anomalies Found?| E{Circuit Breaker}
-        E -->|Yes (Retry < 3)| C
+        E -->|"Yes (Retry &lt; 3)"| C
     end
     
     E -->|No / Max Retries| F[Report Node]
