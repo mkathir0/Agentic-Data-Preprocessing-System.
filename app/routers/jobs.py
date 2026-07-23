@@ -2,7 +2,8 @@ import os
 import shutil
 import asyncio
 from pathlib import Path
-from typing import List
+from typing import List, Dict, Any, Optional
+import httpx
 
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
@@ -150,3 +151,205 @@ def get_report(job_id: str, db: Session = Depends(get_db)):
         filename=os.path.basename(report_file),
         media_type='text/markdown'
     )
+
+
+def map_run_to_agent_name(name: str) -> str:
+    if not name:
+        return "UnknownAgent"
+    name_lower = name.lower()
+    if "run_profiler" in name_lower or "profileragent" in name_lower:
+        return "ProfilerAgent"
+    elif "run_quality_check" in name_lower or "qualityagent" in name_lower:
+        return "QualityAgent"
+    elif "generate_transformation_plan" in name_lower or "planneragent" in name_lower:
+        return "PlannerAgent"
+    elif "generate_cleaning_code" in name_lower or "codegeneratoragent" in name_lower:
+        return "CodeGeneratorAgent"
+    elif "execute_cleaning_code" in name_lower or "executoragent" in name_lower:
+        return "ExecutorAgent"
+    elif "generate_report" in name_lower or "reporteragent" in name_lower:
+        return "ReporterAgent"
+    elif "chatgroq" in name_lower or "groq" in name_lower or "llm" in name_lower:
+        return "LLM (Groq)"
+    elif "schema" in name_lower:
+        return "SchemaAgent"
+    elif "data preprocessing pipeline" in name_lower or "pipeline" in name_lower:
+        return "Pipeline"
+    return name
+
+
+def calculate_duration_ms(run: dict) -> int:
+    start_time = run.get("start_time")
+    end_time = run.get("end_time")
+    if not start_time or not end_time:
+        return 0
+    try:
+        if isinstance(start_time, (int, float)) and isinstance(end_time, (int, float)):
+            return int((end_time - start_time) * 1000)
+        from datetime import datetime
+        s_dt = datetime.fromisoformat(str(start_time).replace("Z", "+00:00"))
+        e_dt = datetime.fromisoformat(str(end_time).replace("Z", "+00:00"))
+        return int((e_dt - s_dt).total_seconds() * 1000)
+    except Exception:
+        return 0
+
+
+def build_run_message(agent_name: str, run: dict, duration_ms: int) -> str:
+    error = run.get("error")
+    if error:
+        return f"Error in {agent_name}: {error}"
+
+    if agent_name == "PlannerAgent":
+        outputs = run.get("outputs") or {}
+        outputs_str = str(outputs)
+        if len(outputs_str) > 150:
+            outputs_str = outputs_str[:150] + "..."
+        return f"PlannerAgent plan: {outputs_str}"
+
+    return f"{agent_name} completed successfully in {duration_ms}ms"
+
+
+@router.get("/{job_id}/langsmith-traces")
+async def get_langsmith_traces(job_id: str, db: Session = Depends(get_db)):
+    api_key = os.environ.get("LANGSMITH_API_KEY")
+    if not api_key:
+        return []
+
+    project_name = os.environ.get("LANGSMITH_PROJECT", "Agentic Data-Preprocessing Pipeline")
+    headers = {"x-api-key": api_key}
+    params = {
+        "project_name": project_name,
+        "run_type": "chain",
+        "limit": 50,
+        "is_root": "true"
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get("https://api.smith.langchain.com/api/v1/runs", headers=headers, params=params)
+            if resp.status_code != 200:
+                return []
+
+            runs_data = resp.json()
+            runs = runs_data if isinstance(runs_data, list) else runs_data.get("runs", [])
+
+            matching_runs = [r for r in runs if r.get("name") == "Data Preprocessing Pipeline"]
+            if not matching_runs:
+                return []
+
+            # Match target root run for this job_id, or pick the most recent root run
+            target_run = None
+            for r in matching_runs:
+                r_inputs = r.get("inputs") or {}
+                if str(r_inputs.get("job_id")) == str(job_id):
+                    target_run = r
+                    break
+
+            if not target_run:
+                target_run = matching_runs[0]
+
+            target_run_id = target_run.get("id")
+
+            # Fetch child runs
+            child_resp = await client.get(
+                "https://api.smith.langchain.com/api/v1/runs",
+                headers=headers,
+                params={"parent_run": target_run_id}
+            )
+
+            child_runs = []
+            if child_resp.status_code == 200:
+                c_data = child_resp.json()
+                child_runs = c_data if isinstance(c_data, list) else c_data.get("runs", [])
+
+            all_runs = [target_run] + child_runs
+
+            events = []
+            for r in all_runs:
+                name = r.get("name", "")
+                agent_name = map_run_to_agent_name(name)
+                dur_ms = calculate_duration_ms(r)
+                msg = build_run_message(agent_name, r, dur_ms)
+
+                err = r.get("error")
+                if err or r.get("status") == "error":
+                    level = "error"
+                elif r.get("extra", {}).get("retry"):
+                    level = "warning"
+                else:
+                    level = "info"
+
+                events.append({
+                    "id": str(r.get("id", "")),
+                    "agent": agent_name,
+                    "level": level,
+                    "message": msg,
+                    "timestamp": str(r.get("start_time") or r.get("created_at") or ""),
+                    "duration_ms": dur_ms,
+                    "tags": r.get("tags") or [],
+                    "inputs": r.get("inputs") or {},
+                    "outputs": r.get("outputs") or {}
+                })
+
+            return events
+
+    except Exception:
+        return []
+
+
+@router.get("/{job_id}/summary")
+@router.get("/{job_id}/phase-summary")
+def get_job_summary(job_id: str, db: Session = Depends(get_db)):
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    report_file = os.path.join(settings.OUTPUT_DIR, f"report_{job.filename.replace('.csv', '.md')}")
+    report_exists = os.path.exists(report_file)
+
+    phases = [
+        {
+            "phase": "Profiling & Analysis",
+            "agent": "ProfilerAgent / QualityAgent / SchemaAgent",
+            "status": "COMPLETED" if job.status in ["PROCESSING", "COMPLETED", "FAILED"] else "PENDING",
+            "details": "Dataset profiling, Pandera data quality checks, and schema inference."
+        },
+        {
+            "phase": "Transformation Planning",
+            "agent": "PlannerAgent",
+            "status": "COMPLETED" if job.status in ["COMPLETED", "FAILED"] and job.cleaning_plan else ("PROCESSING" if job.status == "PROCESSING" else "PENDING"),
+            "details": job.cleaning_plan if job.cleaning_plan else "Generates deterministic transformation plan from profiling findings."
+        },
+        {
+            "phase": "Code Generation & Execution",
+            "agent": "CodeGeneratorAgent / ExecutorAgent",
+            "status": "COMPLETED" if job.status == "COMPLETED" else ("FAILED" if job.status == "FAILED" else "PENDING"),
+            "details": "Generates Pandas cleaning script and executes in isolated environment with automatic retry."
+        },
+        {
+            "phase": "Validation & Verification",
+            "agent": "QualityAgent",
+            "status": "COMPLETED" if job.status == "COMPLETED" else ("FAILED" if job.status == "FAILED" else "PENDING"),
+            "details": "Verifies cleaned dataset against quality criteria to ensure anomaly resolution."
+        },
+        {
+            "phase": "Engineering Report",
+            "agent": "ReporterAgent",
+            "status": "COMPLETED" if report_exists else "PENDING",
+            "details": "Compiles comprehensive engineering audit log and markdown summary report."
+        }
+    ]
+
+    return {
+        "job_id": job.id,
+        "filename": job.filename,
+        "status": job.status,
+        "progress": job.progress,
+        "current_step": job.current_step,
+        "error_message": job.error_message,
+        "original_filepath": job.original_filepath,
+        "cleaned_filepath": job.cleaned_filepath,
+        "report_available": report_exists,
+        "phases": phases
+    }
+
