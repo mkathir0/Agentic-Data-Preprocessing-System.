@@ -30,8 +30,9 @@ class AgentState(TypedDict):
     retry_count: int
     quality_summary: Optional[str]
     
-    # Status
+    # Status tracking
     final_status: str
+    quality_after: Optional[dict]
 
 # 1. Profile and Plan
 def node_profile_and_plan(state: AgentState) -> dict:
@@ -97,7 +98,8 @@ def node_validate(state: AgentState) -> dict:
     else:
         return {
             "error_feedback": None,
-            "quality_summary": quality.summary
+            "quality_summary": quality.summary,
+            "quality_after": quality.model_dump(),
         }
 
 # 4. Report
@@ -168,7 +170,7 @@ def build_graph():
 
 
 @traceable(run_type="chain", name="Data Preprocessing Pipeline")
-def run_pipeline(job_id: str, input_file: str, output_file: str, report_file: str) -> str:
+def run_pipeline(job_id: str, input_file: str, output_file: str, report_file: str) -> dict:
     """Top-level traceable entry point. Every CSV upload creates one LangSmith trace."""
     graph = build_graph()
     initial_state: AgentState = {
@@ -184,7 +186,16 @@ def run_pipeline(job_id: str, input_file: str, output_file: str, report_file: st
         "error_feedback": None,
         "retry_count": 0,
         "quality_summary": None,
+        "quality_after": None,
         "final_status": "PROCESSING",
     }
     result = graph.invoke(initial_state)
-    return result.get("final_status", "COMPLETED")
+    return {
+        "final_status": result.get("final_status", "COMPLETED"),
+        "profiler_data": result.get("profiler_data"),
+        "quality_data": result.get("quality_data"),
+        "quality_after": result.get("quality_after"),
+        "plan_json": result.get("plan_json"),
+        "retry_count": result.get("retry_count", 0),
+        "quality_summary": result.get("quality_summary"),
+    }

@@ -22,3 +22,10 @@ class Job(Base):
     profile_report_path = Column(String, nullable=True)
     quality_report_path = Column(String, nullable=True)
     validation_report_path = Column(String, nullable=True)
+
+    # Phase output data for insights
+    profiler_data = Column(JSON, nullable=True)      # ProfilerOutput
+    quality_before = Column(JSON, nullable=True)     # QualityOutput before cleaning
+    quality_after = Column(JSON, nullable=True)      # QualityOutput after cleaning
+    plan_data = Column(JSON, nullable=True)          # TransformationPlan
+    retry_count = Column(Float, default=0)           # Number of LLM retry attempts
