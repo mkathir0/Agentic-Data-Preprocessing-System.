@@ -20,7 +20,7 @@ router = APIRouter(
     dependencies=[Depends(verify_api_key)]
 )
 
-from app.agents.graph import build_graph
+from app.agents.graph import run_pipeline
 
 def process_job(job_id: str, db: Session):
     def update_status(prog: float, status: str = "PROCESSING", err: str = None, cleaned_file: str = None):
@@ -44,28 +44,18 @@ def process_job(job_id: str, db: Session):
     
     update_status(10.0, "PROCESSING")
     
-    graph = build_graph()
-    
-    # Run the graph
+    # Run the pipeline — this is a @traceable function, so every job
+    # automatically appears as a named run in LangSmith.
     try:
-        final_state = graph.invoke({
-            "job_id": job_id,
-            "input_file": input_file,
-            "output_file": output_file,
-            "report_file": report_file,
-            "retry_count": 0,
-            "profiler_data": None,
-            "quality_data": None,
-            "schema_data": None,
-            "plan_json": None,
-            "current_code": None,
-            "error_feedback": None,
-            "quality_summary": None,
-            "final_status": "PROCESSING"
-        })
+        final_status = run_pipeline(
+            job_id=job_id,
+            input_file=input_file,
+            output_file=output_file,
+            report_file=report_file,
+        )
         
-        if final_state["final_status"] == "FAILED":
-            update_status(100.0, status="FAILED", err=final_state.get("error_feedback", "Validation or Execution failed."))
+        if final_status == "FAILED":
+            update_status(100.0, status="FAILED", err="Validation or execution failed. Check LangSmith for trace.")
         else:
             update_status(100.0, status="COMPLETED", cleaned_file=output_file)
             

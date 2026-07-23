@@ -1,3 +1,9 @@
+import os
+from dotenv import load_dotenv
+
+# Load .env FIRST so LangSmith SDK reads the vars at import time
+load_dotenv()
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 

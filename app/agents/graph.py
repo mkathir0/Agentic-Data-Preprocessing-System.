@@ -1,5 +1,8 @@
+import os
 from typing import TypedDict, Optional
 from langgraph.graph import StateGraph, END
+from langsmith import traceable
+from langsmith.run_helpers import get_current_run_tree
 
 from app.agents.profiler import run_profiler
 from app.agents.quality import run_quality_check
@@ -162,3 +165,26 @@ def build_graph():
     workflow.add_edge("report", END)
     
     return workflow.compile()
+
+
+@traceable(run_type="chain", name="Data Preprocessing Pipeline")
+def run_pipeline(job_id: str, input_file: str, output_file: str, report_file: str) -> str:
+    """Top-level traceable entry point. Every CSV upload creates one LangSmith trace."""
+    graph = build_graph()
+    initial_state: AgentState = {
+        "job_id": job_id,
+        "input_file": input_file,
+        "output_file": output_file,
+        "report_file": report_file,
+        "profiler_data": None,
+        "quality_data": None,
+        "schema_data": None,
+        "plan_json": None,
+        "current_code": None,
+        "error_feedback": None,
+        "retry_count": 0,
+        "quality_summary": None,
+        "final_status": "PROCESSING",
+    }
+    result = graph.invoke(initial_state)
+    return result.get("final_status", "COMPLETED")
