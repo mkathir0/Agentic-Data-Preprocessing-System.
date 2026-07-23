@@ -1,0 +1,32 @@
+[92m12:56:10 - LiteLLM:WARNING[0m: get_model_cost_map.py:290 - LiteLLM: Failed to fetch remote model cost map from https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json: [Errno 54] Connection reset by peer. Falling back to local backup.
+INFO:     Started server process [75801]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+INFO:     127.0.0.1:58471 - "POST /api/jobs/upload HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58472 - "GET /api/jobs/c483d124-3d51-4d27-9199-254e47ca8367 HTTP/1.1" 200 OK
+Summarize dataset:   0%|          | 0/5 [00:00<?, ?it/s]Summarize dataset:   0%|          | 0/18 [00:00<?, ?it/s, Describe variable: ride_id]Summarize dataset:   0%|          | 0/18 [00:00<?, ?it/s, Describe variable: rideable_type]Summarize dataset:   0%|          | 0/18 [00:00<?, ?it/s, Describe variable: started_at]   Summarize dataset:   0%|          | 0/18 [00:00<?, ?it/s, Describe variable: ended_at]  Summarize dataset:   0%|          | 0/18 [00:00<?, ?it/s, Describe variable: start_station_name]Summarize dataset:   0%|          | 0/18 [00:00<?, ?it/s, Describe variable: start_station_id]  Summarize dataset:   0%|          | 0/18 [00:00<?, ?it/s, Describe variable: end_station_name]Summarize dataset:   0%|          | 0/18 [00:00<?, ?it/s, Describe variable: end_station_id]  Summarize dataset:   0%|          | 0/18 [00:00<?, ?it/s, Describe variable: start_lat]     Summarize dataset:   0%|          | 0/18 [00:00<?, ?it/s, Describe variable: start_lng]
+  0%|          | 0/13 [00:00<?, ?it/s][ASummarize dataset:   6%|▌         | 1/18 [00:00<00:00, 27.54it/s, Describe variable: end_lat]Summarize dataset:  11%|█         | 2/18 [00:00<00:01, 12.70it/s, Describe variable: end_lat]Summarize dataset:  11%|█         | 2/18 [00:00<00:01, 12.70it/s, Describe variable: end_lng]Summarize dataset:  17%|█▋        | 3/18 [00:00<00:01, 12.70it/s, Describe variable: member_casual]
+  8%|▊         | 1/13 [00:00<00:01,  7.12it/s][A100%|██████████| 13/13 [00:00<00:00, 91.25it/s]
+Summarize dataset:  72%|███████▏  | 13/18 [00:00<00:00, 12.70it/s, Get variable types]             Summarize dataset:  74%|███████▎  | 14/19 [00:00<00:00, 12.70it/s, Get dataframe statistics]Summarize dataset:  79%|███████▉  | 15/19 [00:00<00:00, 12.70it/s, Get scatter matrix]      Summarize dataset:  79%|███████▉  | 15/19 [00:00<00:00, 12.70it/s, Take sample]       Summarize dataset:  84%|████████▍ | 16/19 [00:00<00:00, 12.70it/s, Detecting duplicates]Summarize dataset:  89%|████████▉ | 17/19 [00:00<00:00, 12.70it/s, Get alerts]          Summarize dataset:  95%|█████████▍| 18/19 [00:00<00:00, 12.70it/s, Get reproduction details]Summarize dataset: 100%|██████████| 19/19 [00:00<00:00, 12.70it/s, Completed]               Summarize dataset: 100%|██████████| 19/19 [00:00<00:00, 106.88it/s, Completed]
+/Users/mithrajitkathir/Documents/Data Pipeline Orchestrator/backend/app/agents/schema_agent.py:54: UserWarning: Could not infer format, so each element will be parsed individually, falling back to `dateutil`. To ensure parsing is consistent and as-expected, please specify a format.
+  pd.to_datetime(non_null_series.head(100), errors='raise')
+/Users/mithrajitkathir/Documents/Data Pipeline Orchestrator/backend/app/agents/schema_agent.py:54: UserWarning: Could not infer format, so each element will be parsed individually, falling back to `dateutil`. To ensure parsing is consistent and as-expected, please specify a format.
+  pd.to_datetime(non_null_series.head(100), errors='raise')
+/Users/mithrajitkathir/Documents/Data Pipeline Orchestrator/backend/app/agents/schema_agent.py:54: UserWarning: Could not infer format, so each element will be parsed individually, falling back to `dateutil`. To ensure parsing is consistent and as-expected, please specify a format.
+  pd.to_datetime(non_null_series.head(100), errors='raise')
+/Users/mithrajitkathir/Documents/Data Pipeline Orchestrator/backend/app/agents/schema_agent.py:54: UserWarning: Could not infer format, so each element will be parsed individually, falling back to `dateutil`. To ensure parsing is consistent and as-expected, please specify a format.
+  pd.to_datetime(non_null_series.head(100), errors='raise')
+/Users/mithrajitkathir/Documents/Data Pipeline Orchestrator/backend/app/agents/schema_agent.py:54: UserWarning: Could not infer format, so each element will be parsed individually, falling back to `dateutil`. To ensure parsing is consistent and as-expected, please specify a format.
+  pd.to_datetime(non_null_series.head(100), errors='raise')
+/Users/mithrajitkathir/Documents/Data Pipeline Orchestrator/backend/app/agents/schema_agent.py:54: UserWarning: Could not infer format, so each element will be parsed individually, falling back to `dateutil`. To ensure parsing is consistent and as-expected, please specify a format.
+  pd.to_datetime(non_null_series.head(100), errors='raise')
+INFO:     127.0.0.1:58483 - "GET /api/jobs/c483d124-3d51-4d27-9199-254e47ca8367 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58497 - "GET /api/jobs/c483d124-3d51-4d27-9199-254e47ca8367 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58498 - "GET /api/jobs/c483d124-3d51-4d27-9199-254e47ca8367/download HTTP/1.1" 200 OK
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [75801]
+/Users/mithrajitkathir/.local/share/uv/python/cpython-3.11.13-macos-aarch64-none/lib/python3.11/multiprocessing/resource_tracker.py:254: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '
