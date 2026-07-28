@@ -16,6 +16,22 @@ def execute_cleaning_code(code_str: str, input_csv_path: str, output_csv_path: s
 import pandas as pd
 import json
 import sys
+import os
+
+def load_dataframe(filepath: str, **kwargs) -> pd.DataFrame:
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext == ".csv":
+        return pd.read_csv(filepath, **kwargs)
+    elif ext in [".xlsx", ".xls"]:
+        return pd.read_excel(filepath, **kwargs)
+    elif ext == ".json":
+        return pd.read_json(filepath, **kwargs)
+    elif ext == ".parquet":
+        return pd.read_parquet(filepath, **kwargs)
+    elif ext == ".tsv":
+        return pd.read_csv(filepath, sep="\\t", **kwargs)
+    else:
+        return pd.read_csv(filepath, **kwargs)
 
 # --- LLM Generated Code ---
 {code_str}
@@ -24,7 +40,7 @@ import sys
 def main():
     try:
         # 1. Read input dataset
-        df = pd.read_csv('{input_csv_path}')
+        df = load_dataframe('{input_csv_path}')
         
         # 2. Execute cleaning function
         cleaned_df = clean_data(df)

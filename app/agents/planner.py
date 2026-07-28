@@ -3,8 +3,8 @@ from langchain_core.messages import SystemMessage, HumanMessage
 
 from app.config import get_settings
 from app.agents.schemas import (
-    ProfilerOutput, 
-    QualityOutput, 
+    ProfilerOutput,
+    QualityOutput,
     SchemaOutput,
     TransformationPlan
 )
@@ -16,41 +16,59 @@ def generate_transformation_plan(
 ) -> TransformationPlan:
     """
     Uses an LLM to read the deterministic profiling data and output a structured cleaning plan.
+    Each action must include: action_type, explanation, confidence (high/medium/low),
+    assumption (any assumption made), and estimated_rows_affected_pct.
     """
     settings = get_settings()
-    
-    # Extract the model name if it starts with groq/
+
     model_name = settings.LLM_MODEL.replace("groq/", "") if settings.LLM_MODEL.startswith("groq/") else settings.LLM_MODEL
-    
-    # Initialize LangChain Groq model and bind structured output
+
     llm = ChatGroq(model=model_name, temperature=0, api_key=settings.GROQ_API_KEY)
     structured_llm = llm.with_structured_output(TransformationPlan)
-    
+
     prompt = f"""
-    You are an expert Data Engineer. You have been provided with deterministic data profiling, 
+    You are an expert Data Engineer. You have been provided with deterministic data profiling,
     quality, and schema information for a messy dataset.
-    
+
     Your task is to create a deterministic TransformationPlan to clean this dataset.
     Only suggest transformations that are strongly supported by the data anomalies provided.
-    
+
     --- Profiler Data ---
     {profiler_data.model_dump_json(indent=2)}
-    
+
     --- Quality Data (Anomalies) ---
     {quality_data.model_dump_json(indent=2)}
-    
+
     --- Schema Inference ---
     {schema_data.model_dump_json(indent=2)}
-    
-    Generate a TransformationPlan detailing the steps to clean this dataset.
-    For each action, specify the column it applies to (or None for global actions), the type of action 
-    (e.g., 'drop_missing', 'fill_missing_median', 'drop_duplicates', 'cast_to_datetime'), and a brief explanation.
+
+    For EACH action you plan, you MUST provide:
+    1. `action_type`: The transformation (e.g. 'drop_duplicates', 'fill_missing_median', 'cast_to_datetime', 'drop_column')
+    2. `column`: The column name, or null if global
+    3. `explanation`: Why this transformation is needed based on the data
+    4. `confidence`: 
+       - "high" = well-supported by clear statistics (e.g. dropping exact duplicates, fixing clear dtype mismatch)
+       - "medium" = reasonable heuristic but some uncertainty (e.g. median imputation on skewed data)
+       - "low" = uncertain or may alter data meaning (e.g. filling an ID/PK column, imputing >20% of values, dropping rows with nulls in important columns)
+    5. `assumption`: Any assumption you are making about the data that a human would need to know to audit this decision. 
+       Examples: "assumed missing station_id = dockless GPS ride", "assumed negative prices are data entry errors not credits",
+       "assumed duplicate ride_ids are true duplicates not re-used IDs across time periods".
+       Write null if no assumption is being made.
+    6. `estimated_rows_affected_pct`: Your best estimate of what fraction of rows (0.0-1.0) this action will touch,
+       based on the profiling data. E.g. if 5% of rows have nulls in this column, put 0.05.
+
+    Also provide:
+    - `dataset_summary`: A 1-2 sentence plain-English description of the dataset's current state
+    - `global_assumptions`: A list of any high-level assumptions that apply across multiple steps
+      (e.g. "This appears to be a bike-share trip dataset", "Duplicate IDs appear to be true duplicates not re-used keys")
+
+    Generate a TransformationPlan now.
     """
-    
+
     messages = [
-        SystemMessage(content="You are a precise data engineering planner."),
+        SystemMessage(content="You are a precise data engineering planner. Always fill in the confidence, assumption, and estimated_rows_affected_pct fields — never leave them missing."),
         HumanMessage(content=prompt)
     ]
-    
+
     plan = structured_llm.invoke(messages)
     return plan

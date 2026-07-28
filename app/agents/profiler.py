@@ -6,16 +6,16 @@ import logging
 from langsmith import traceable
 
 from app.agents.schemas import ProfilerOutput
+from app.utils.data_loader import load_dataframe
 
 logger = logging.getLogger(__name__)
 
 @traceable
 def run_profiler(csv_path: str) -> ProfilerOutput:
     """
-    Run the profiler agent on a raw CSV file.
-    Returns a structured ProfilerOutput Pydantic model.
+    Reads the dataset and generates a deterministic summary of data quality.
     """
-    df = pd.read_csv(csv_path)
+    df = load_dataframe(csv_path)
     
     # We use minimal mode for ydata-profiling to be fast and deterministic
     profile = ProfileReport(df, minimal=True)

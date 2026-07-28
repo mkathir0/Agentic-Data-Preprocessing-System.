@@ -2,13 +2,14 @@ import pandas as pd
 from typing import Dict
 
 from app.agents.schemas import SchemaOutput
+from app.utils.data_loader import load_dataframe
 
 def run_schema_inference(csv_path: str) -> SchemaOutput:
     """
     Analyzes the dataframe to infer primary keys, foreign keys, and semantic types.
     Returns a SchemaOutput model.
     """
-    df = pd.read_csv(csv_path)
+    df = load_dataframe(csv_path)
     num_rows = len(df)
     
     primary_keys = []

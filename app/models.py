@@ -28,4 +28,5 @@ class Job(Base):
     quality_before = Column(JSON, nullable=True)     # QualityOutput before cleaning
     quality_after = Column(JSON, nullable=True)      # QualityOutput after cleaning
     plan_data = Column(JSON, nullable=True)          # TransformationPlan
+    validation_report = Column(JSON, nullable=True)  # ValidationReport
     retry_count = Column(Float, default=0)           # Number of LLM retry attempts

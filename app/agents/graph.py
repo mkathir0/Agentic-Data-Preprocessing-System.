@@ -5,7 +5,7 @@ from langsmith import traceable
 from langsmith.run_helpers import get_current_run_tree
 
 from app.agents.profiler import run_profiler
-from app.agents.quality import run_quality_check
+from app.agents.quality import run_quality_check, run_full_validation
 from app.agents.schema_agent import run_schema_inference
 from app.agents.planner import generate_transformation_plan
 from app.agents.code_generator import generate_cleaning_code
@@ -33,6 +33,7 @@ class AgentState(TypedDict):
     # Status tracking
     final_status: str
     quality_after: Optional[dict]
+    validation_report: Optional[dict]
 
 # 1. Profile and Plan
 def node_profile_and_plan(state: AgentState) -> dict:
@@ -82,25 +83,44 @@ def node_generate_and_execute(state: AgentState) -> dict:
 
 # 3. Validate
 def node_validate(state: AgentState) -> dict:
+    import json
+    from app.agents.schemas import SchemaOutput
+    
     # If code crashed during execution, don't try to validate the non-existent output
     if state.get("error_feedback"):
         return state
         
-    quality = run_quality_check(state["output_file"])
+    schema_obj = SchemaOutput.model_validate(state["schema_data"]) if state.get("schema_data") else None
+    plan_dict = json.loads(state["plan_json"]) if state.get("plan_json") else {}
+    plan_actions = plan_dict.get("actions", [])
     
-    if not quality.is_valid:
-        anomalies_str = str([a.model_dump() for a in quality.anomalies if a.severity == "high"])
-        return {
-            "error_feedback": f"Validation failed. Remaining high-severity anomalies on the cleaned data: {anomalies_str}",
-            "retry_count": state["retry_count"] + 1,
-            "quality_summary": quality.summary
-        }
-    else:
-        return {
-            "error_feedback": None,
-            "quality_summary": quality.summary,
-            "quality_after": quality.model_dump(),
-        }
+    # Run full 7-category validation
+    report = run_full_validation(
+        input_path=state["input_file"],
+        output_path=state["output_file"],
+        schema=schema_obj,
+        profiler_before=state.get("profiler_data"),
+        plan_actions=plan_actions
+    )
+    
+    if not report.overall_passed:
+        high_sev = [flag.model_dump() for flag in report.escalation_flags if flag.severity == "high"]
+        # If there are high severity flags, we consider it a failure requiring rewrite
+        if high_sev:
+            return {
+                "error_feedback": f"Validation failed with high severity issues: {str(high_sev)}. Fix the code.",
+                "retry_count": state["retry_count"] + 1,
+                "quality_summary": "High severity anomalies remain.",
+                "validation_report": report.model_dump()
+            }
+            
+    return {
+        "error_feedback": None,
+        "quality_summary": f"Passed {report.total_passed}/{report.total_checks} checks.",
+        "validation_report": report.model_dump(),
+        # For backward compatibility with older logic just in case:
+        "quality_after": {"is_valid": report.overall_passed, "summary": "Full validation complete", "anomalies": []}
+    }
 
 # 4. Report
 def node_report(state: AgentState) -> dict:
@@ -187,6 +207,7 @@ def run_pipeline(job_id: str, input_file: str, output_file: str, report_file: st
         "retry_count": 0,
         "quality_summary": None,
         "quality_after": None,
+        "validation_report": None,
         "final_status": "PROCESSING",
     }
     result = graph.invoke(initial_state)
@@ -195,6 +216,7 @@ def run_pipeline(job_id: str, input_file: str, output_file: str, report_file: st
         "profiler_data": result.get("profiler_data"),
         "quality_data": result.get("quality_data"),
         "quality_after": result.get("quality_after"),
+        "validation_report": result.get("validation_report"),
         "plan_json": result.get("plan_json"),
         "retry_count": result.get("retry_count", 0),
         "quality_summary": result.get("quality_summary"),

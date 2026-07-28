@@ -68,6 +68,9 @@ def process_job(job_id: str, db: Session):
 
             # quality_after is already model_dump()'d in node_validate
             job.quality_after = result.get("quality_after")
+            
+            # validation_report is already model_dump()'d in node_validate
+            job.validation_report = result.get("validation_report")
 
             # plan_json is a JSON string — parse it back to dict for storage
             plan_json_str = result.get("plan_json")
@@ -94,41 +97,42 @@ def process_job(job_id: str, db: Session):
         update_status(100.0, status="FAILED", err=str(e))
 
 
-@router.post("/upload", response_model=JobUploadResponse)
-async def upload_csv(
+@router.post("/upload", response_model=List[JobUploadResponse])
+async def upload_files(
     background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
+    files: List[UploadFile] = File(...),
     db: Session = Depends(get_db)
 ):
-    if not file.filename.endswith(".csv"):
-        raise HTTPException(status_code=400, detail="File must be a CSV")
-
     # Ensure upload directory exists
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
     os.makedirs(settings.OUTPUT_DIR, exist_ok=True)
 
-    file_path = os.path.join(settings.UPLOAD_DIR, file.filename)
+    new_jobs = []
     
-    # Save the file (Size limits removed per request)
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    for file in files:
+        file_path = os.path.join(settings.UPLOAD_DIR, file.filename)
+        
+        # Save the file
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
 
-    # Create job in database
-    new_job = Job(
-        filename=file.filename,
-        original_filepath=file_path,
-        status="PENDING",
-        current_step="PENDING",
-        progress=0.0
-    )
-    db.add(new_job)
-    db.commit()
-    db.refresh(new_job)
+        # Create job in database
+        new_job = Job(
+            filename=file.filename,
+            original_filepath=file_path,
+            status="PENDING",
+            current_step="PENDING",
+            progress=0.0
+        )
+        db.add(new_job)
+        db.commit()
+        db.refresh(new_job)
+        new_jobs.append(new_job)
 
-    # Start execution task
-    background_tasks.add_task(process_job, new_job.id, db)
+        # Start execution task
+        background_tasks.add_task(process_job, new_job.id, db)
 
-    return new_job
+    return new_jobs
 
 @router.get("/", response_model=List[JobResponse])
 def get_all_jobs(db: Session = Depends(get_db)):
@@ -186,138 +190,14 @@ def get_insights(job_id: str, db: Session = Depends(get_db)):
     if job.status != "COMPLETED":
         raise HTTPException(status_code=400, detail="Job not completed yet")
 
-    phases = []
-
-    # ── Phase 1: Profiling ─────────────────────────────────────────────────────
-    pd = job.profiler_data or {}
-    qb = job.quality_before or {}
-    qb_anomalies = qb.get("anomalies", [])
-
-    missing_cols = [
-        a for a in qb_anomalies if a.get("anomaly_type") == "missing_values"
-    ]
-    dup_anomaly = next((a for a in qb_anomalies if a.get("anomaly_type") == "duplicate_rows"), None)
-    mixed_type_cols = [a for a in qb_anomalies if a.get("anomaly_type") == "mixed_types"]
-    high_sev = [a for a in qb_anomalies if a.get("severity") == "high"]
-    med_sev = [a for a in qb_anomalies if a.get("severity") == "medium"]
-
-    # Build column type breakdown
-    col_types: dict = pd.get("column_types", {})
-    numeric_cols = [c for c, t in col_types.items() if "Numeric" in t or "numeric" in t]
-    text_cols = [c for c, t in col_types.items() if "Text" in t or "Categorical" in t or "text" in t]
-    datetime_cols = [c for c, t in col_types.items() if "Date" in t or "date" in t]
-
-    profiler_lines = []
-    if pd:
-        profiler_lines.append(f"Dataset has **{pd.get('num_rows', '?'):,} rows** and **{pd.get('num_columns', '?')} columns**")
-        profiler_lines.append(f"Memory footprint: {round(pd.get('memory_usage_bytes', 0) / 1024, 1)} KB")
-        if numeric_cols:
-            profiler_lines.append(f"Numeric columns ({len(numeric_cols)}): {', '.join(numeric_cols[:6])}{' …' if len(numeric_cols) > 6 else ''}")
-        if text_cols:
-            profiler_lines.append(f"Text/categorical columns ({len(text_cols)}): {', '.join(text_cols[:6])}{' …' if len(text_cols) > 6 else ''}")
-        if datetime_cols:
-            profiler_lines.append(f"Date columns ({len(datetime_cols)}): {', '.join(datetime_cols)}")
-    if qb_anomalies:
-        profiler_lines.append(f"Pandera detected **{len(qb_anomalies)} anomalies**: {len(high_sev)} high-severity, {len(med_sev)} medium-severity")
-    if dup_anomaly:
-        profiler_lines.append(f"Duplicate rows found: **{dup_anomaly.get('affected_count', 0)}** ({round(dup_anomaly.get('affected_percentage', 0)*100, 1)}% of dataset)")
-    if missing_cols:
-        worst = sorted(missing_cols, key=lambda x: x.get('affected_percentage', 0), reverse=True)
-        top = worst[:3]
-        profiler_lines.append(
-            "Top missing-value columns: " +
-            ", ".join(f"'{a['column']}' ({round(a.get('affected_percentage',0)*100,1)}% null)" for a in top)
-        )
-    if mixed_type_cols:
-        names = [a.get('column','?') for a in mixed_type_cols[:3]]
-        profiler_lines.append(f"Mixed-type columns: {', '.join(names)} — values contain both strings and numbers")
-
-    phases.append({
-        "phase": "Phase 1 — Profiling & Quality Scan",
-        "color": "cyan",
-        "status": "completed",
-        "lines": profiler_lines or ["No profiling data available for this job."],
-    })
-
-    # ── Phase 2: LLM Transformation Plan ──────────────────────────────────────
-    plan = job.plan_data or {}
-    actions = plan.get("actions", [])
-    dataset_summary = plan.get("dataset_summary", "")
-
-    plan_lines = []
-    if dataset_summary:
-        plan_lines.append(f"LLM assessment: \"*{dataset_summary}*\"")
-    if actions:
-        plan_lines.append(f"**{len(actions)} transformation steps** planned:")
-        for i, action in enumerate(actions[:10], 1):
-            col = f" on `{action['column']}`" if action.get('column') else " (whole dataset)"
-            plan_lines.append(f"{i}. **{action['action_type']}**{col} — {action['explanation']}")
-        if len(actions) > 10:
-            plan_lines.append(f"… and {len(actions) - 10} more steps")
-    else:
-        plan_lines.append("No transformation plan available for this job.")
-
-    phases.append({
-        "phase": "Phase 2 — LLM Transformation Plan",
-        "color": "purple",
-        "status": "completed",
-        "lines": plan_lines,
-    })
-
-    # ── Phase 3: Code Gen & Execution ─────────────────────────────────────────
-    retry_count = int(job.retry_count or 0)
-    exec_lines = []
-    if retry_count == 0:
-        exec_lines.append("LLM-generated Pandas cleaning script **executed successfully on the first attempt**")
-    else:
-        exec_lines.append(f"Initial script failed — LLM analysed the traceback and rewrote the code")
-        exec_lines.append(f"Required **{retry_count} retry attempt{'s' if retry_count > 1 else ''}** before success")
-    if job.cleaned_filepath:
-        exec_lines.append(f"Output written to: `cleaned_{job.filename}`")
-
-    phases.append({
-        "phase": "Phase 3 — Code Generation & Execution",
-        "color": "green" if retry_count == 0 else "amber",
-        "status": "completed",
-        "lines": exec_lines,
-        "badge": "1 retry" if retry_count > 0 else "First pass",
-    })
-
-    # ── Phase 4: Post-clean Validation ────────────────────────────────────────
-    qa = job.quality_after or {}
-    qa_anomalies = qa.get("anomalies", [])
-    qa_valid = qa.get("is_valid", True)
-    qa_summary = qa.get("summary", "")
-
-    val_lines = []
-    if qa:
-        if qa_valid:
-            val_lines.append("Pandera post-clean validation **passed** — no high-severity anomalies remain")
-        else:
-            val_lines.append("Pandera post-clean validation detected remaining issues")
-        if qa_summary:
-            val_lines.append(qa_summary)
-        # Compare before vs after
-        before_count = len(qb_anomalies)
-        after_count = len(qa_anomalies)
-        if before_count > 0:
-            resolved = before_count - after_count
-            val_lines.append(f"Anomalies resolved: **{resolved} of {before_count}** ({round(resolved/before_count*100)}%)")
-        remaining_high = [a for a in qa_anomalies if a.get("severity") == "high"]
-        if remaining_high:
-            val_lines.append(f"Remaining high-severity issues: {len(remaining_high)}")
-    else:
-        val_lines.append("Post-clean validation data not available for this job.")
-
-    phases.append({
-        "phase": "Phase 4 — Post-Clean Validation",
-        "color": "green" if qa_valid else "red",
-        "status": "completed" if qa_valid else "failed",
-        "lines": val_lines,
-        "badge": "✓ Passed" if qa_valid else "✗ Issues remain",
-    })
-
-    return {"job_id": job_id, "filename": job.filename, "phases": phases}
+    return {
+        "job_id": job.id,
+        "filename": job.filename,
+        "profiler_data": job.profiler_data,
+        "plan_data": job.plan_data,
+        "validation_report": job.validation_report,
+        "retry_count": job.retry_count
+    }
 
 
 
