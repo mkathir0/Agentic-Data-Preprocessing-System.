@@ -43,17 +43,19 @@ def generate_transformation_plan(
     {schema_data.model_dump_json(indent=2)}
 
     For EACH action you plan, you MUST provide:
-    1. `action_type`: The transformation (e.g. 'drop_duplicates', 'fill_missing_median', 'cast_to_datetime', 'drop_column')
+    1. `action_type`: The transformation (e.g. 'drop_duplicates', 'fill_missing_median', 'cast_to_datetime', 'drop_column'). 
+       **IMPORTANT**: If your confidence is "low", you MUST set the action_type to "flag_for_review" and do NOT suggest a data mutation.
     2. `column`: The column name, or null if global
     3. `explanation`: Why this transformation is needed based on the data
     4. `confidence`: 
        - "high" = well-supported by clear statistics (e.g. dropping exact duplicates, fixing clear dtype mismatch)
        - "medium" = reasonable heuristic but some uncertainty (e.g. median imputation on skewed data)
-       - "low" = uncertain or may alter data meaning (e.g. filling an ID/PK column, imputing >20% of values, dropping rows with nulls in important columns)
+       - "low" = uncertain or may alter data meaning (e.g. filling an ID/PK column, imputing >20% of values). MUST use "flag_for_review".
     5. `assumption`: Any assumption you are making about the data that a human would need to know to audit this decision. 
        Examples: "assumed missing station_id = dockless GPS ride", "assumed negative prices are data entry errors not credits",
        "assumed duplicate ride_ids are true duplicates not re-used IDs across time periods".
        Write null if no assumption is being made.
+       **IMPORTANT**: Do not blindly fill missing semantic/categorical data with 'Unknown'. If missingness has semantic meaning (e.g. missing bike station names imply a dockless ride), suggest creating a boolean indicator column (e.g. `is_dockless`) and leaving the original column as null, rather than destroying the signal.
     6. `estimated_rows_affected_pct`: Your best estimate of what fraction of rows (0.0-1.0) this action will touch,
        based on the profiling data. E.g. if 5% of rows have nulls in this column, put 0.05.
 

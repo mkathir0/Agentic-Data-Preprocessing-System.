@@ -42,6 +42,10 @@ def generate_cleaning_code(plan: TransformationPlan, error_feedback: str = None,
     You should write a function called `clean_data(df: pd.DataFrame) -> pd.DataFrame`
     that implements the actions described in the plan.
     
+    CRITICAL: If an action in the TransformationPlan is 'flag_for_review' or has 'low' confidence,
+    **DO NOT** write pandas code to impute, drop, or alter that data. You MUST preserve the original
+    values (including NaNs) for human review. You may add a python comment about it, but do not mutate the df for that step.
+    
     Return ONLY valid, executable Python code in the 'code' field of the output.
     Ensure that any required imports (like pandas) are included.
     Do NOT include markdown backticks like ```python in the 'code' field.

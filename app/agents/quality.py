@@ -199,7 +199,7 @@ def _find_temporal_pairs(df: pd.DataFrame):
     pairs = []
     start_patterns = re.compile(r'start|begin|created|open|from', re.I)
     end_patterns   = re.compile(r'end|finish|closed|to\b|stop', re.I)
-    date_hint      = re.compile(r'date|time|at\b|_at$|_on$', re.I)
+    date_hint      = re.compile(r'date|time|\bat\b|_at$|_on$', re.I)
 
     start_cols = [c for c in df.columns if start_patterns.search(c) and date_hint.search(c)]
     end_cols   = [c for c in df.columns if end_patterns.search(c)   and date_hint.search(c)]
@@ -209,7 +209,8 @@ def _find_temporal_pairs(df: pd.DataFrame):
             # e.g. started_at / ended_at, created_at / closed_at
             sc_root = re.sub(r'start|begin|from', '', sc, flags=re.I).strip('_').lower()
             ec_root = re.sub(r'end|finish|to|stop', '', ec, flags=re.I).strip('_').lower()
-            if sc_root == ec_root or abs(len(sc) - len(ec)) <= 4:
+            # Require the root to match (e.g. 'ed_at' == 'ed_at') to avoid false positives like 'start_lat' and 'ended_at'
+            if sc_root == ec_root:
                 pairs.append((sc, ec))
     return pairs
 
@@ -227,18 +228,18 @@ def check_cross_field(df: pd.DataFrame, schema: Optional[SchemaOutput] = None) -
             s = pd.to_datetime(df[start_col], errors='coerce')
             e = pd.to_datetime(df[end_col],   errors='coerce')
             both_valid = s.notna() & e.notna()
-            inverted   = (both_valid) & (e <= s)
+            inverted   = (both_valid) & (e < s)
             inv_count  = int(inverted.sum())
             example = None
             if inv_count > 0:
                 idx = inverted[inverted].index[0]
                 example = f"Row {idx}: {start_col}={df[start_col].iloc[idx]}, {end_col}={df[end_col].iloc[idx]}"
-            checks.append(_check("cross_field", f"Temporal: {end_col} > {start_col}",
+            checks.append(_check("cross_field", f"Temporal: {end_col} >= {start_col}",
                 passed=(inv_count == 0), violations=inv_count,
-                details=f"{inv_count} rows where {end_col} ≤ {start_col}"))
+                details=f"{inv_count} rows where {end_col} < {start_col}"))
             if inv_count > 0:
                 violations.append(BusinessRuleViolation(
-                    rule=f"{end_col} > {start_col}",
+                    rule=f"{end_col} >= {start_col}",
                     violation_count=inv_count,
                     violation_pct=_pct(inv_count, n),
                     disposition="flagged",
@@ -368,9 +369,9 @@ def check_distributional(
     n_before = len(df_before)
     n_after  = len(df_after)
 
-    numeric_before = set(df_before.select_dtypes(include='number').columns)
-    numeric_after  = set(df_after.select_dtypes(include='number').columns)
-    common_numeric = numeric_before & numeric_after
+    cols_before = set(df_before.columns)
+    cols_after  = set(df_after.columns)
+    common_cols = cols_before & cols_after
 
     # Build a lookup of which columns had fill/imputation actions
     imputed_cols = set()
@@ -381,7 +382,7 @@ def check_distributional(
                 if col:
                     imputed_cols.add(col)
 
-    for col in sorted(common_numeric):
+    for col in sorted(common_cols):
         before = df_before[col].dropna()
         after  = df_after[col].dropna()
         if len(before) == 0 or len(after) == 0:
