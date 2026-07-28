@@ -685,7 +685,7 @@ def run_quality_check(csv_path: str, previous_anomalies: Optional[List[Dict[str,
         if not check.passed:
             anomalies.append(QualityAnomaly(
                 anomaly_type="range_bound_violation",
-                description=f"{check.description}. Details: {check.details}",
+                description=f"{check.name}. Details: {check.details}",
                 severity="high" if check.violations > num_rows * 0.05 else "medium",
                 affected_count=check.violations,
                 affected_percentage=float(check.violations) / num_rows if num_rows > 0 else 0
@@ -697,7 +697,7 @@ def run_quality_check(csv_path: str, previous_anomalies: Optional[List[Dict[str,
         if not check.passed:
             anomalies.append(QualityAnomaly(
                 anomaly_type="cross_field_violation",
-                description=f"{check.description}. Details: {check.details}",
+                description=f"{check.name}. Details: {check.details}",
                 severity="high" if check.violations > num_rows * 0.05 else "medium",
                 affected_count=check.violations,
                 affected_percentage=float(check.violations) / num_rows if num_rows > 0 else 0
@@ -708,7 +708,7 @@ def run_quality_check(csv_path: str, previous_anomalies: Optional[List[Dict[str,
         if not check.passed:
             anomalies.append(QualityAnomaly(
                 anomaly_type="format_violation",
-                description=f"{check.description}. Details: {check.details}",
+                description=f"{check.name}. Details: {check.details}",
                 severity="medium" if check.violations > num_rows * 0.05 else "low",
                 affected_count=check.violations,
                 affected_percentage=float(check.violations) / num_rows if num_rows > 0 else 0
