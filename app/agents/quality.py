@@ -88,9 +88,12 @@ def check_schema(
         passed=(len(dropped) == 0), violations=len(dropped),
         details=f"Dropped: {dropped}" if dropped else "All original columns preserved"))
 
+    # Filter out columns that were intentionally created by the pipeline
+    unexpected_added = [c for c in added if not c.endswith('_review') and not c.startswith('is_') and not c.startswith('has_')]
+    
     checks.append(_check("schema", "No unexpected new columns added",
-        passed=(len(added) == 0), violations=len(added),
-        details=f"Added: {added}" if added else "No new columns introduced"))
+        passed=(len(unexpected_added) == 0), violations=len(unexpected_added),
+        details=f"Unexpectedly added: {unexpected_added}" if unexpected_added else "No unexpected new columns introduced"))
 
     # Non-null constraints on PKs / IDs
     if schema and schema.primary_keys:
@@ -674,6 +677,41 @@ def run_quality_check(csv_path: str, previous_anomalies: Optional[List[Dict[str,
                 anomaly_type="mixed_types",
                 description=f"Column '{col_name}' contains mixed data types: {type_names}.",
                 severity="medium"
+            ))
+
+    # 7-Layer Context: Expose deeper violations to the Planner
+    # 1. Range bounds
+    for check in check_range_bounds(df):
+        if not check.passed:
+            anomalies.append(QualityAnomaly(
+                anomaly_type="range_bound_violation",
+                description=f"{check.description}. Details: {check.details}",
+                severity="high" if check.violations > num_rows * 0.05 else "medium",
+                affected_count=check.violations,
+                affected_percentage=float(check.violations) / num_rows if num_rows > 0 else 0
+            ))
+            
+    # 2. Cross-field & Business Rules
+    cf_checks, _, _ = check_cross_field(df, None)
+    for check in cf_checks:
+        if not check.passed:
+            anomalies.append(QualityAnomaly(
+                anomaly_type="cross_field_violation",
+                description=f"{check.description}. Details: {check.details}",
+                severity="high" if check.violations > num_rows * 0.05 else "medium",
+                affected_count=check.violations,
+                affected_percentage=float(check.violations) / num_rows if num_rows > 0 else 0
+            ))
+            
+    # 3. Format & Whitespace
+    for check in check_format_encoding(df, None):
+        if not check.passed:
+            anomalies.append(QualityAnomaly(
+                anomaly_type="format_violation",
+                description=f"{check.description}. Details: {check.details}",
+                severity="medium" if check.violations > num_rows * 0.05 else "low",
+                affected_count=check.violations,
+                affected_percentage=float(check.violations) / num_rows if num_rows > 0 else 0
             ))
 
     is_valid = len([a for a in anomalies if a.severity in ["high"]]) == 0
