@@ -42,6 +42,11 @@ def generate_transformation_plan(
     --- Schema Inference ---
     {schema_data.model_dump_json(indent=2)}
 
+    CRITICAL INSTRUCTIONS FOR ANOMALIES:
+    You MUST propose a fix for ALL anomalies reported in the Quality Data. Do not ignore them!
+    - For whitespace/format issues (e.g. leading/trailing spaces), propose a 'strip_whitespace' action (confidence: high).
+    - For cross-field business rule violations (e.g. ended_at < started_at) or range bounds (e.g. speed > 200), you MUST propose an action to fix them. If you can confidently fix them (e.g. 'drop_invalid_rows', 'swap_dates'), do so. If you cannot confidently fix them, you MUST propose a 'flag_for_review' action so they are explicitly escalated to a human.
+
     For EACH action you plan, you MUST provide:
     1. `action_type`: The transformation (e.g. 'drop_duplicates', 'fill_missing_median', 'cast_to_datetime', 'drop_column'). 
        **IMPORTANT**: If your confidence is "low", you MUST set the action_type to "flag_for_review" and do NOT suggest a data mutation.
