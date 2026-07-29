@@ -174,6 +174,20 @@ def check_range_bounds(df: pd.DataFrame) -> List[ValidationCheck]:
                     details="; ".join(detail_parts) if detail_parts else f"All values within [{lo}, {hi}]"))
                 break
 
+        # Generic IQR Outlier Detection
+        if not re.search(r'\bid\b|_id$|uuid|lat|lng|lon', col, re.I) and len(series) > 10:
+            q1 = series.quantile(0.25)
+            q3 = series.quantile(0.75)
+            iqr = q3 - q1
+            if iqr > 0:
+                lower_bound = q1 - 3 * iqr
+                upper_bound = q3 + 3 * iqr
+                outliers = int(((series < lower_bound) | (series > upper_bound)).sum())
+                if outliers > 0:
+                    checks.append(_check("range_bounds", f"'{col}' has no extreme statistical outliers",
+                        passed=False, violations=outliers,
+                        details=f"{outliers} extreme outliers detected beyond 3x IQR ({lower_bound:g} to {upper_bound:g})"))
+
     # Date sanity
     for col in df.columns:
         if 'date' in col.lower() or 'time' in col.lower() or 'at' in col.lower():
@@ -268,11 +282,29 @@ def _find_conditional_nulls(df: pd.DataFrame, patterns: List[MissingnessPattern]
                     ))
 
 def _find_math_relationships(df: pd.DataFrame, checks: List[ValidationCheck], violations: List[BusinessRuleViolation], n: int):
-    num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    # Coerce to numeric (if a column has numbers but is typed as object due to sentinels, this will catch it)
+    num_cols = []
+    coerced_df = pd.DataFrame(index=df.index)
+    for c in df.columns:
+        if pd.api.types.is_numeric_dtype(df[c]):
+            num_cols.append(c)
+            coerced_df[c] = df[c]
+        else:
+            # Try to coerce
+            try:
+                numeric_series = pd.to_numeric(df[c], errors='coerce')
+                # If it's mostly numeric (> 50% non-null after coercion), treat it as numeric for math
+                if numeric_series.notna().sum() > len(df) * 0.5:
+                    num_cols.append(c)
+                    coerced_df[c] = numeric_series
+            except Exception:
+                pass
+                
     if len(num_cols) < 3:
         return
         
-    sample_df = df.sample(min(10000, n)) if n > 10000 else df
+    sample_df = coerced_df.sample(min(10000, n)) if n > 10000 else coerced_df
+    df_for_math = coerced_df
     
     for i, c1 in enumerate(num_cols):
         for j, c2 in enumerate(num_cols):
@@ -289,8 +321,8 @@ def _find_math_relationships(df: pd.DataFrame, checks: List[ValidationCheck], vi
                 add_match = np.isclose(sample_df[c1] + sample_df[c2], sample_df[c3], equal_nan=False)
                 add_rate = add_match[valid_mask].sum() / valid_count
                 if 0.5 < add_rate < 1.0:
-                    full_valid = df[c1].notna() & df[c2].notna() & df[c3].notna()
-                    full_add_match = np.isclose(df[c1] + df[c2], df[c3], equal_nan=False)
+                    full_valid = df_for_math[c1].notna() & df_for_math[c2].notna() & df_for_math[c3].notna()
+                    full_add_match = np.isclose(df_for_math[c1] + df_for_math[c2], df_for_math[c3], equal_nan=False)
                     failed = full_valid & ~full_add_match
                     fail_count = int(failed.sum())
                     if fail_count > 0:
@@ -301,8 +333,8 @@ def _find_math_relationships(df: pd.DataFrame, checks: List[ValidationCheck], vi
                 mul_match = np.isclose(sample_df[c1] * sample_df[c2], sample_df[c3], equal_nan=False)
                 mul_rate = mul_match[valid_mask].sum() / valid_count
                 if 0.5 < mul_rate < 1.0:
-                    full_valid = df[c1].notna() & df[c2].notna() & df[c3].notna()
-                    full_mul_match = np.isclose(df[c1] * df[c2], df[c3], equal_nan=False)
+                    full_valid = df_for_math[c1].notna() & df_for_math[c2].notna() & df_for_math[c3].notna()
+                    full_mul_match = np.isclose(df_for_math[c1] * df_for_math[c2], df_for_math[c3], equal_nan=False)
                     failed = full_valid & ~full_mul_match
                     fail_count = int(failed.sum())
                     if fail_count > 0:
@@ -478,10 +510,12 @@ def check_duplicates(df: pd.DataFrame, schema: Optional[SchemaOutput] = None) ->
     if schema and schema.primary_keys:
         pks = schema.primary_keys
     else:
-        # Heuristic PK detection
+        # Heuristic PK detection: column must look like an ID AND have high uniqueness (cardinality > 95% of rows)
         for col in df.columns:
             if re.search(r'\bid\b|_id$|uuid', col, re.I):
-                pks.append(col)
+                cardinality_ratio = df[col].nunique() / n if n > 0 else 0
+                if cardinality_ratio > 0.95:
+                    pks.append(col)
                 
     for pk in pks:
         if pk in df.columns:
