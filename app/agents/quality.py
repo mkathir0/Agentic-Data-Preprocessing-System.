@@ -189,6 +189,20 @@ def check_range_bounds(df: pd.DataFrame) -> List[ValidationCheck]:
                     checks.append(_check("range_bounds", f"'{col}' date bounds (no future/pre-1900)",
                         passed=(total_violations == 0), violations=total_violations,
                         details="; ".join(details) if details else "All dates within expected range"))
+                        
+                # Check for mixed date formats
+                if df[col].dtype == object:
+                    s = df[col].dropna().astype(str)
+                    has_slash = s.str.contains(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}')
+                    if has_slash.any():
+                        extracted = s[has_slash].str.extract(r'(\d{1,2})[/-](\d{1,2})[/-]')
+                        if extracted.shape[1] == 2:
+                            part1 = pd.to_numeric(extracted[0], errors='coerce')
+                            part2 = pd.to_numeric(extracted[1], errors='coerce')
+                            if (part1 > 12).any() and (part2 > 12).any():
+                                checks.append(_check("format_encoding", f"'{col}' has mixed date formats (DD/MM vs MM/DD)",
+                                    passed=False, violations=len(s),
+                                    details=f"Column contains ambiguous dates that mix DD/MM and MM/DD formats, risking silent mis-parsing"))
             except Exception:
                 pass
 
@@ -216,6 +230,84 @@ def _find_temporal_pairs(df: pd.DataFrame):
             if sc_root == ec_root:
                 pairs.append((sc, ec))
     return pairs
+
+def _find_conditional_nulls(df: pd.DataFrame, patterns: List[MissingnessPattern], n: int):
+    null_matrix = df.isnull()
+    for target_col in df.columns:
+        null_count = null_matrix[target_col].sum()
+        if null_count < max(5, 0.01 * n):
+            continue
+            
+        for cond_col in df.columns:
+            if target_col == cond_col:
+                continue
+            # Only check categorical/low cardinality columns for conditions
+            if df[cond_col].nunique() > 20:
+                continue
+                
+            for val, count in df[cond_col].value_counts().items():
+                if count < max(5, 0.01 * n):
+                    continue
+                
+                mask = (df[cond_col] == val)
+                target_nulls_in_cond = null_matrix.loc[mask, target_col].sum()
+                
+                prob_null_given_cond = target_nulls_in_cond / count
+                prob_cond_given_null = target_nulls_in_cond / null_count
+                
+                if prob_null_given_cond > 0.95 and prob_cond_given_null > 0.5:
+                    patterns.append(MissingnessPattern(
+                        columns=[target_col, cond_col],
+                        pattern_type="conditional_structural",
+                        co_null_pct=round(float(prob_null_given_cond), 4),
+                        description=(
+                            f"'{target_col}' is missing in {round(prob_null_given_cond*100, 1)}% "
+                            f"of rows where '{cond_col}' == '{val}'. This is a structural "
+                            f"business rule (conditional null), not random missingness."
+                        )
+                    ))
+
+def _find_math_relationships(df: pd.DataFrame, checks: List[ValidationCheck], violations: List[BusinessRuleViolation], n: int):
+    num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    if len(num_cols) < 3:
+        return
+        
+    sample_df = df.sample(min(10000, n)) if n > 10000 else df
+    
+    for i, c1 in enumerate(num_cols):
+        for j, c2 in enumerate(num_cols):
+            if i >= j: continue
+            for c3 in num_cols:
+                if c3 == c1 or c3 == c2: continue
+                
+                valid_mask = sample_df[c1].notna() & sample_df[c2].notna() & sample_df[c3].notna()
+                valid_count = valid_mask.sum()
+                if valid_count < max(10, 0.05 * n):
+                    continue
+                
+                # Test addition
+                add_match = np.isclose(sample_df[c1] + sample_df[c2], sample_df[c3], equal_nan=False)
+                add_rate = add_match[valid_mask].sum() / valid_count
+                if 0.5 < add_rate < 1.0:
+                    full_valid = df[c1].notna() & df[c2].notna() & df[c3].notna()
+                    full_add_match = np.isclose(df[c1] + df[c2], df[c3], equal_nan=False)
+                    failed = full_valid & ~full_add_match
+                    fail_count = int(failed.sum())
+                    if fail_count > 0:
+                        checks.append(_check("cross_field", f"Math Rule: {c1} + {c2} = {c3}", passed=False, violations=fail_count, details=f"{fail_count} rows violate {c1} + {c2} = {c3}"))
+                        violations.append(BusinessRuleViolation(rule=f"{c1} + {c2} = {c3}", violation_count=fail_count, violation_pct=_pct(fail_count, n), disposition="flagged", example=f"{fail_count} rows violate the discovered math rule"))
+                        
+                # Test multiplication
+                mul_match = np.isclose(sample_df[c1] * sample_df[c2], sample_df[c3], equal_nan=False)
+                mul_rate = mul_match[valid_mask].sum() / valid_count
+                if 0.5 < mul_rate < 1.0:
+                    full_valid = df[c1].notna() & df[c2].notna() & df[c3].notna()
+                    full_mul_match = np.isclose(df[c1] * df[c2], df[c3], equal_nan=False)
+                    failed = full_valid & ~full_mul_match
+                    fail_count = int(failed.sum())
+                    if fail_count > 0:
+                        checks.append(_check("cross_field", f"Math Rule: {c1} * {c2} = {c3}", passed=False, violations=fail_count, details=f"{fail_count} rows violate {c1} * {c2} = {c3}"))
+                        violations.append(BusinessRuleViolation(rule=f"{c1} * {c2} = {c3}", violation_count=fail_count, violation_pct=_pct(fail_count, n), disposition="flagged", example=f"{fail_count} rows violate the discovered math rule"))
 
 def check_cross_field(df: pd.DataFrame, schema: Optional[SchemaOutput] = None) -> Tuple[List[ValidationCheck], List[BusinessRuleViolation], List[MissingnessPattern]]:
     checks = []
@@ -252,7 +344,6 @@ def check_cross_field(df: pd.DataFrame, schema: Optional[SchemaOutput] = None) -
             pass
 
     # Mutual null pattern detection
-    # Find groups of columns that are always null together
     null_matrix = df.isnull()
     cols = list(df.columns)
     checked_pairs = set()
@@ -292,70 +383,8 @@ def check_cross_field(df: pd.DataFrame, schema: Optional[SchemaOutput] = None) -
                         )
                     ))
 
-    # Geo-sanity: duration vs distance if we have lat/lng and duration
-    lat_start = next((c for c in df.columns if re.search(r'start.*lat|lat.*start', c, re.I)), None)
-    lng_start = next((c for c in df.columns if re.search(r'start.*lng|lng.*start|start.*lon|lon.*start', c, re.I)), None)
-    lat_end   = next((c for c in df.columns if re.search(r'end.*lat|lat.*end', c, re.I)), None)
-    lng_end   = next((c for c in df.columns if re.search(r'end.*lng|lng.*end|end.*lon|lon.*end', c, re.I)), None)
-    dur_col   = next((c for c in df.columns if re.search(r'duration|seconds|minutes|trip_time', c, re.I)), None)
-
-    temporal_pairs = _find_temporal_pairs(df)
-
-    if lat_start and lng_start and lat_end and lng_end:
-        try:
-            # Haversine approximation (fast, vectorised)
-            R = 6371  # Earth radius km
-            lat1 = np.radians(df[lat_start].dropna())
-            lat2 = np.radians(df[lat_end].dropna())
-            lon1 = np.radians(df[lng_start].dropna())
-            lon2 = np.radians(df[lng_end].dropna())
-            idx  = lat1.index.intersection(lat2.index).intersection(lon1.index).intersection(lon2.index)
-            dlat = lat2[idx] - lat1[idx]
-            dlon = lon2[idx] - lon1[idx]
-            a = np.sin(dlat/2)**2 + np.cos(lat1[idx]) * np.cos(lat2[idx]) * np.sin(dlon/2)**2
-            dist_km = 2 * R * np.arcsin(np.sqrt(a))
-
-            # If duration available, check speed
-            if dur_col and pd.api.types.is_numeric_dtype(df[dur_col]):
-                dur_sec = df[dur_col].reindex(idx)
-                dur_hr  = dur_sec / 3600.0
-                speed   = dist_km / dur_hr.replace(0, np.nan)
-                # >200 km/h is implausible for a bike/scooter ride
-                implausible = int((speed > 200).sum())
-                checks.append(_check("cross_field", "Geo-sanity: speed plausible for ride duration",
-                    passed=(implausible == 0), violations=implausible,
-                    details=f"{implausible} rows with implausible speed (>200 km/h) given distance and duration"))
-                if implausible > 0:
-                    violations.append(BusinessRuleViolation(
-                        rule="speed = distance / duration ≤ 200 km/h",
-                        violation_count=implausible,
-                        violation_pct=_pct(implausible, n),
-                        disposition="flagged",
-                        example=f"Computed from {lat_start}, {lng_start} → {lat_end}, {lng_end} / {dur_col}"
-                    ))
-            elif temporal_pairs:
-                # Use first temporal pair to estimate duration
-                sc, ec = temporal_pairs[0]
-                try:
-                    s = pd.to_datetime(df[sc], errors='coerce').reindex(idx)
-                    e = pd.to_datetime(df[ec], errors='coerce').reindex(idx)
-                    dur_hr = ((e - s).dt.total_seconds() / 3600).replace(0, np.nan)
-                    speed  = dist_km / dur_hr
-                    implausible = int((speed > 200).sum())
-                    checks.append(_check("cross_field", "Geo-sanity: speed plausible for ride duration",
-                        passed=(implausible == 0), violations=implausible,
-                        details=f"{implausible} rows with implausible speed (>200 km/h)"))
-                    if implausible > 0:
-                        violations.append(BusinessRuleViolation(
-                            rule="speed = distance / duration ≤ 200 km/h",
-                            violation_count=implausible,
-                            violation_pct=_pct(implausible, n),
-                            disposition="flagged"
-                        ))
-                except Exception:
-                    pass
-        except Exception:
-            pass
+    _find_conditional_nulls(df, patterns, n)
+    _find_math_relationships(df, checks, violations, n)
 
     return checks, violations, patterns
 
@@ -445,16 +474,30 @@ def check_duplicates(df: pd.DataFrame, schema: Optional[SchemaOutput] = None) ->
 
     # Key-based duplicates: same PK, different other values
     key_dup_total = 0
+    pks = []
     if schema and schema.primary_keys:
-        for pk in schema.primary_keys:
-            if pk in df.columns:
-                pk_dup = int(df.duplicated(subset=[pk], keep=False).sum())
-                exact_dup_pk = int(df.duplicated().sum())
-                key_only_dup = max(0, pk_dup - exact_dup_pk)
-                key_dup_total += key_only_dup
-                checks.append(_check("duplicates", f"No key-based duplicates on '{pk}'",
-                    passed=(key_only_dup == 0), violations=key_only_dup,
-                    details=f"{key_only_dup} rows share the same '{pk}' but have different other values (worse than exact duplicates)"))
+        pks = schema.primary_keys
+    else:
+        # Heuristic PK detection
+        for col in df.columns:
+            if re.search(r'\bid\b|_id$|uuid', col, re.I):
+                pks.append(col)
+                
+    for pk in pks:
+        if pk in df.columns:
+            pk_dup_mask = df.duplicated(subset=[pk], keep=False)
+            exact_dup_mask = df.duplicated(keep=False)
+            key_conflict_mask = pk_dup_mask & ~exact_dup_mask
+            key_only_dup = int(key_conflict_mask.sum())
+            key_dup_total += key_only_dup
+            if key_only_dup > 0:
+                checks.append(_check("duplicates", f"No key-based conflicts on '{pk}'",
+                    passed=False, violations=key_only_dup,
+                    details=f"{key_only_dup} rows share the same '{pk}' but have conflicting data in other columns (Primary Key Conflict)"))
+            else:
+                checks.append(_check("duplicates", f"No key-based conflicts on '{pk}'",
+                    passed=True, violations=0,
+                    details=f"No Primary Key conflicts found on '{pk}'"))
 
     # Near-duplicate string normalisation check on object columns
     for col in df.select_dtypes(include='object').columns:
@@ -503,6 +546,18 @@ def check_format_encoding(df: pd.DataFrame, schema: Optional[SchemaOutput] = Non
             checks.append(_check("format_encoding", f"'{col}' — no garbled unicode (mojibake)",
                 passed=False, violations=mojibake,
                 details=f"{mojibake} values contain replacement characters or control chars"))
+
+        # Sentinel value detection
+        coerced = pd.to_numeric(series, errors='coerce')
+        parsed_count = coerced.notna().sum()
+        total_count = len(series)
+        if parsed_count > 0.5 * total_count and parsed_count < total_count:
+            sentinels = series[coerced.isna()].value_counts()
+            sentinel_count = total_count - parsed_count
+            sentinel_examples = ", ".join([f"'{k}'" for k in sentinels.head(3).index])
+            checks.append(_check("format_encoding", f"'{col}' contains sentinel strings preventing numeric casting",
+                passed=False, violations=sentinel_count,
+                details=f"{sentinel_count} non-numeric string values found (e.g. {sentinel_examples}) in otherwise numeric column"))
 
     # Format pattern conformity based on column name hints
     inferred_types = schema.inferred_types if schema else {}

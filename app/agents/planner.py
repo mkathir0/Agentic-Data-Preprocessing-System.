@@ -44,7 +44,8 @@ def generate_transformation_plan(
 
     CRITICAL INSTRUCTIONS FOR ANOMALIES:
     You MUST propose a fix for ALL anomalies reported in the Quality Data. Do not ignore them!
-    - For whitespace/format issues (e.g. leading/trailing spaces), propose a 'strip_whitespace' action (confidence: high).
+    - For whitespace/format issues (e.g. leading/trailing spaces), propose a 'strip_whitespace' action (confidence: high). 
+    - **IMPORTANT ORDERING**: You MUST apply whitespace stripping and formatting fixes BEFORE dropping exact duplicates. Trailing spaces can hide exact duplicates, so deduping must happen after whitespace fixes!
     - For cross-field business rule violations (e.g. ended_at < started_at) or range bounds (e.g. speed > 200), you MUST propose an action to fix them. If you can confidently fix them (e.g. 'drop_invalid_rows', 'swap_dates'), do so. If you cannot confidently fix them, you MUST propose a 'flag_for_review' action so they are explicitly escalated to a human.
 
     For EACH action you plan, you MUST provide:
