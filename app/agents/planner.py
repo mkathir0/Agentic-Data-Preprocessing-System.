@@ -60,7 +60,7 @@ def generate_transformation_plan(
        Examples: "assumed missing station_id = dockless GPS ride", "assumed negative prices are data entry errors not credits",
        "assumed duplicate ride_ids are true duplicates not re-used IDs across time periods".
        Write null if no assumption is being made.
-       **IMPORTANT**: Do not blindly fill missing semantic/categorical data with 'Unknown'. If missingness has semantic meaning (e.g. missing bike station names imply a dockless ride), suggest creating a boolean indicator column (e.g. `is_dockless`) and leaving the original column as null, rather than destroying the signal.
+       **IMPORTANT**: Do not blindly fill missing semantic/categorical data with 'Unknown'. If missingness has semantic meaning (e.g. missing bike station names imply a dockless ride), suggest creating a boolean indicator column (e.g. `is_dockless_start`, `is_dockless_end` - ensure names are unique to the source column!) and leaving the original column as null, rather than destroying the signal.
     6. `estimated_rows_affected_pct`: Your best estimate of what fraction of rows (0.0-1.0) this action will touch,
        based on the profiling data. E.g. if 5% of rows have nulls in this column, put 0.05.
 
