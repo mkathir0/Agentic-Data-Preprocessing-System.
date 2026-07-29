@@ -258,7 +258,7 @@ def _find_conditional_nulls(df: pd.DataFrame, patterns: List[MissingnessPattern]
                 if prob_null_given_cond > 0.95 and prob_cond_given_null > 0.5:
                     patterns.append(MissingnessPattern(
                         columns=[target_col, cond_col],
-                        pattern_type="conditional_structural",
+                        pattern_type="structural",
                         co_null_pct=round(float(prob_null_given_cond), 4),
                         description=(
                             f"'{target_col}' is missing in {round(prob_null_given_cond*100, 1)}% "
