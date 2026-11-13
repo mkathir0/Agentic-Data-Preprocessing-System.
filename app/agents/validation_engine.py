@@ -391,10 +391,11 @@ def check_cross_field_relations(
 
     # 1. Temporal Ordering
     start_patterns = re.compile(r'start|begin|created|order_date|opened|from', re.I)
-    end_patterns = re.compile(r'end|finish|closed|ship_date|resolved|to\b|stop', re.I)
+    end_patterns = re.compile(r'end|finish|closed|ship_date|resolved|to\b|stop|delivery_date', re.I)
     date_hint = re.compile(r'date|time|\bat\b|_at$|_on$', re.I)
+    indicator_pattern = re.compile(r'missing|indicator|flag|isna|_is_|_has_|^is_|^has_', re.I)
 
-    date_cols = [c for c in df.columns if date_hint.search(c)]
+    date_cols = [c for c in df.columns if date_hint.search(c) and not indicator_pattern.search(c)]
     for sc in date_cols:
         if not start_patterns.search(sc):
             continue
@@ -441,13 +442,13 @@ def check_cross_field_relations(
         c for c in df.columns 
         if pd.api.types.is_numeric_dtype(df[c]) 
         and not pd.api.types.is_bool_dtype(df[c])
-        and not c.startswith('is_') 
-        and not c.startswith('has_')
-        and not re.search(r'\bid\b|_id$|uuid|lat|lng|lon', c, re.I)
+        and not indicator_pattern.search(c)
+        and not re.search(r'\bid\b|_id$|uuid|lat|lng|lon|rating|zip|postal', c, re.I)
+        and df[c].nunique() > 10
     ]
     if len(num_cols) >= 3:
         sample_df = df[num_cols].dropna()
-        min_sample = min(n, 2)
+        min_sample = min(n, 10)
         if len(sample_df) >= min_sample:
             for i, c1 in enumerate(num_cols):
                 for j, c2 in enumerate(num_cols):
@@ -462,10 +463,16 @@ def check_cross_field_relations(
                         if v_count < min_sample:
                             continue
 
-                        # Addition check: c1 + c2 = c3
+                        # Ensure columns are not dominated by zeros
+                        non_zero_1 = (df.loc[valid_mask, c1] != 0).mean()
+                        non_zero_2 = (df.loc[valid_mask, c2] != 0).mean()
+                        if non_zero_1 < 0.2 or non_zero_2 < 0.2:
+                            continue
+
+                        # Addition check: c1 + c2 = c3 (must hold on at least 85% of data to be a real law)
                         add_close = np.isclose(df.loc[valid_mask, c1] + df.loc[valid_mask, c2], df.loc[valid_mask, c3], rtol=1e-2, atol=1e-2)
                         add_rate = add_close.sum() / v_count
-                        if 0.50 < add_rate < 0.999:
+                        if 0.85 <= add_rate < 0.999:
                             fail_count = int((~add_close).sum())
                             checks.append(_check(
                                 "cross_field",
@@ -482,10 +489,10 @@ def check_cross_field_relations(
                                 example=f"{fail_count} rows with arithmetic discrepancy"
                             ))
 
-                        # Multiplication check: c1 * c2 = c3
+                        # Multiplication check: c1 * c2 = c3 (must hold on at least 85% of data to be a real law)
                         mul_close = np.isclose(df.loc[valid_mask, c1] * df.loc[valid_mask, c2], df.loc[valid_mask, c3], rtol=1e-2, atol=1e-2)
                         mul_rate = mul_close.sum() / v_count
-                        if 0.50 < mul_rate < 0.999:
+                        if 0.85 <= mul_rate < 0.999:
                             fail_count = int((~mul_close).sum())
                             checks.append(_check(
                                 "cross_field",
@@ -645,7 +652,9 @@ def execute_full_validation_engine(
 
     # ── Category 2: Range & Bounds ──
     for col in df_after.columns:
-        if not pd.api.types.is_numeric_dtype(df_after[col]):
+        if not pd.api.types.is_numeric_dtype(df_after[col]) or pd.api.types.is_bool_dtype(df_after[col]):
+            continue
+        if re.search(r'missing|indicator|flag|isna', col, re.I):
             continue
         series = df_after[col].dropna()
         if len(series) == 0:
