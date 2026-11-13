@@ -87,9 +87,12 @@ def process_job(job_id: str, db: Session):
                 job.status = "FAILED"
                 job.progress = 100.0
                 job.error_message = "Validation or execution failed after max retries."
+                if os.path.exists(output_file):
+                    job.cleaned_filepath = output_file
             else:
                 job.status = "COMPLETED"
                 job.progress = 100.0
+                job.error_message = None
                 job.cleaned_filepath = output_file
             db.commit()
             
@@ -154,7 +157,7 @@ def download_cleaned_csv(job_id: str, db: Session = Depends(get_db)):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     
-    if job.status != "COMPLETED":
+    if job.status not in ["COMPLETED", "FAILED"]:
         raise HTTPException(status_code=400, detail="Job is not completed yet")
         
     if not job.cleaned_filepath or not os.path.exists(job.cleaned_filepath):
@@ -171,7 +174,7 @@ def get_report(job_id: str, db: Session = Depends(get_db)):
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    if job.status != "COMPLETED":
+    if job.status not in ["COMPLETED", "FAILED"]:
         raise HTTPException(status_code=400, detail="Job is not completed yet")
     report_file = os.path.join(settings.OUTPUT_DIR, f"report_{job.filename.replace('.csv', '.md')}")
     if not os.path.exists(report_file):
@@ -187,7 +190,7 @@ def get_insights(job_id: str, db: Session = Depends(get_db)):
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    if job.status != "COMPLETED":
+    if job.status not in ["COMPLETED", "FAILED"]:
         raise HTTPException(status_code=400, detail="Job not completed yet")
 
     return {
