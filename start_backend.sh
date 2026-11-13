@@ -78,3 +78,4 @@ echo "Starting FastAPI server with auto-reload enabled (Ctrl+C to stop)..."
 echo ""
 
 exec $CMD
+
