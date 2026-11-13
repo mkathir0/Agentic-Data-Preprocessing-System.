@@ -72,9 +72,7 @@ def generate_transformation_plan(
         )
 
     model_name = settings.LLM_MODEL.replace("groq/", "") if settings.LLM_MODEL.startswith("groq/") else settings.LLM_MODEL
-
-    llm = ChatGroq(model=model_name, temperature=0, api_key=settings.GROQ_API_KEY)
-    structured_llm = llm.with_structured_output(TransformationPlan)
+    candidates = list(dict.fromkeys([model_name, "openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]))
 
     prompt = f"""
     You are an expert Data Engineer. You have been provided with deterministic data profiling,
@@ -128,5 +126,14 @@ def generate_transformation_plan(
         HumanMessage(content=prompt)
     ]
 
-    plan = structured_llm.invoke(messages)
-    return plan
+    last_err = None
+    for cand in candidates:
+        try:
+            llm = ChatGroq(model=cand, temperature=0, api_key=settings.GROQ_API_KEY)
+            structured_llm = llm.with_structured_output(TransformationPlan)
+            plan = structured_llm.invoke(messages)
+            return plan
+        except Exception as e:
+            last_err = e
+            continue
+    raise last_err

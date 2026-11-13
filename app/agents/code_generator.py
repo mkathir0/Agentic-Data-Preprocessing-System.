@@ -48,10 +48,7 @@ def generate_cleaning_code(plan: TransformationPlan, error_feedback: str = None,
 
     # Extract the model name if it starts with groq/
     model_name = settings.LLM_MODEL.replace("groq/", "") if settings.LLM_MODEL.startswith("groq/") else settings.LLM_MODEL
-    
-    # Initialize LangChain Groq model and bind structured output
-    llm = ChatGroq(model=model_name, temperature=0, api_key=settings.GROQ_API_KEY)
-    structured_llm = llm.with_structured_output(CodeGenerationOutput)
+    candidates = list(dict.fromkeys([model_name, "openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]))
     
     prompt = f"""
     You are an expert Data Engineer writing production Python code.
@@ -91,5 +88,14 @@ def generate_cleaning_code(plan: TransformationPlan, error_feedback: str = None,
         HumanMessage(content=prompt)
     ]
     
-    code_gen = structured_llm.invoke(messages)
-    return code_gen
+    last_err = None
+    for cand in candidates:
+        try:
+            llm = ChatGroq(model=cand, temperature=0, api_key=settings.GROQ_API_KEY)
+            structured_llm = llm.with_structured_output(CodeGenerationOutput)
+            code_gen = structured_llm.invoke(messages)
+            return code_gen
+        except Exception as e:
+            last_err = e
+            continue
+    raise last_err

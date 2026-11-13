@@ -17,11 +17,11 @@ Base.metadata.create_all(bind=engine)
 app = FastAPI(title="AI Data Engineer Backend")
 settings = get_settings()
 
-# Strict CORS for frontend (supports localhost and 127.0.0.1 on all dev ports)
+# Strict CORS for frontend (supports localhost, 127.0.0.1, [::1] on all dev ports)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.ALLOWED_ORIGINS,
-    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:[0-9]+)?$",
+    allow_origin_regex=r".*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
