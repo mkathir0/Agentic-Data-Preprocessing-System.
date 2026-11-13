@@ -1,8 +1,8 @@
 import os
-from typing import TypedDict, Optional
+import json
+from typing import TypedDict, Optional, Dict, Any
 from langgraph.graph import StateGraph, END
 from langsmith import traceable
-from langsmith.run_helpers import get_current_run_tree
 
 from app.agents.profiler import run_profiler
 from app.agents.quality import run_quality_check, run_full_validation
@@ -11,6 +11,7 @@ from app.agents.planner import generate_transformation_plan
 from app.agents.code_generator import generate_cleaning_code
 from app.agents.executor import execute_cleaning_code
 from app.agents.reporter import generate_report
+from app.agents.schemas import TransformationPlan, SchemaOutput
 
 class AgentState(TypedDict):
     job_id: str
@@ -18,83 +19,102 @@ class AgentState(TypedDict):
     output_file: str
     report_file: str
     
-    # Context
+    # Context (Phase 1 & 2)
     profiler_data: Optional[dict]
     quality_data: Optional[dict]
     schema_data: Optional[dict]
-    
-    # State tracking
     plan_json: Optional[str]
+    
+    # State tracking & Self-Healing Loop (Phase 3 & 4)
     current_code: Optional[str]
     error_feedback: Optional[str]
     retry_count: int
     quality_summary: Optional[str]
     
-    # Status tracking
+    # Validation & Final Status (Phase 5 & Report)
     final_status: str
     quality_after: Optional[dict]
     validation_report: Optional[dict]
 
-# 1. Profile and Plan
-def node_profile_and_plan(state: AgentState) -> dict:
+
+# ── Stage 1: Profile ─────────────────────────────────────────────────────────
+def node_profile(state: AgentState) -> dict:
+    """Profiles the raw dataset: computes statistics, infers schema, and scans initial anomalies."""
     input_file = state["input_file"]
     
     profiler_data = run_profiler(input_file)
     quality_data = run_quality_check(input_file)
     schema_data = run_schema_inference(input_file)
     
-    plan = generate_transformation_plan(profiler_data, quality_data, schema_data)
-    
     return {
-        "profiler_data": profiler_data,
+        "profiler_data": profiler_data.model_dump() if hasattr(profiler_data, "model_dump") else profiler_data,
         "quality_data": quality_data.model_dump(),
-        "schema_data": schema_data,
-        "plan_json": plan.model_dump_json(),
-        "plan_obj": plan # Note: Pydantic object
+        "schema_data": schema_data.model_dump() if hasattr(schema_data, "model_dump") else schema_data,
     }
 
-# 2. Generate and Execute
-def node_generate_and_execute(state: AgentState) -> dict:
-    import json
-    from app.agents.schemas import TransformationPlan
+
+# ── Stage 2: Plan ────────────────────────────────────────────────────────────
+def node_plan(state: AgentState) -> dict:
+    """Uses LLM to create a structured TransformationPlan based purely on deterministic profiling evidence."""
+    from app.agents.schemas import ProfilerOutput, QualityOutput, SchemaOutput
     
+    p_data = ProfilerOutput.model_validate(state["profiler_data"])
+    q_data = QualityOutput.model_validate(state["quality_data"])
+    s_data = SchemaOutput.model_validate(state["schema_data"])
+    
+    plan = generate_transformation_plan(p_data, q_data, s_data)
+    
+    return {
+        "plan_json": plan.model_dump_json()
+    }
+
+
+# ── Stage 3: Code (Generate) ────────────────────────────────────────────────
+def node_code(state: AgentState) -> dict:
+    """Generates executable Python pandas code to satisfy the plan. Receives Pandera feedback if retrying."""
     plan_obj = TransformationPlan.model_validate_json(state["plan_json"])
     
     code_output = generate_cleaning_code(
-        plan=plan_obj, 
-        error_feedback=state.get("error_feedback"), 
+        plan=plan_obj,
+        error_feedback=state.get("error_feedback"),
         previous_code=state.get("current_code")
     )
     
-    code = code_output.code
+    return {
+        "current_code": code_output.code
+    }
+
+
+# ── Stage 4: Execute ────────────────────────────────────────────────────────
+def node_execute(state: AgentState) -> dict:
+    """Safely executes the generated code in an isolated subprocess against the input dataset."""
+    code = state["current_code"]
     exec_result = execute_cleaning_code(code, state["input_file"], state["output_file"])
     
     if not exec_result["success"]:
         return {
-            "current_code": code,
             "error_feedback": f"Execution failed: {exec_result['error']}",
             "retry_count": state["retry_count"] + 1
         }
     else:
         return {
-            "current_code": code,
-            "error_feedback": None # Successfully executed
+            "error_feedback": None
         }
 
-# 3. Validate
+
+# ── Stage 5: Validate ───────────────────────────────────────────────────────
 def node_validate(state: AgentState) -> dict:
-    import json
-    from app.agents.schemas import SchemaOutput
-    
-    # If code crashed during execution, don't try to validate the non-existent output
-    if state.get("error_feedback"):
+    """
+    Validates cleaned output using Pandera schema contracts, 7 quality invariant categories,
+    fuzzy deduplication, key-conflict detection, and before/after quality scoring.
+    """
+    if state.get("error_feedback") and not os.path.exists(state["output_file"]):
         return state
         
     schema_obj = SchemaOutput.model_validate(state["schema_data"]) if state.get("schema_data") else None
     plan_dict = json.loads(state["plan_json"]) if state.get("plan_json") else {}
     plan_actions = plan_dict.get("actions", [])
     
-    # Run full 7-category validation
     report = run_full_validation(
         input_path=state["input_file"],
         output_path=state["output_file"],
@@ -103,27 +123,48 @@ def node_validate(state: AgentState) -> dict:
         plan_actions=plan_actions
     )
     
-    if not report.overall_passed:
-        high_sev = [flag.model_dump() for flag in report.escalation_flags if flag.severity == "high"]
-        # If there are high severity flags, we consider it a failure requiring rewrite
+    report_dict = report.model_dump()
+    high_sev = [flag.model_dump() for flag in report.escalation_flags if flag.severity == "high"]
+    has_pandera_errors = not report.pandera_schema_passed
+    
+    # If high severity violations or Pandera schema errors exist, trigger the circuit breaker
+    if not report.overall_passed and (high_sev or has_pandera_errors):
+        feedback_parts = []
+        if has_pandera_errors and report.pandera_failure_cases:
+            feedback_parts.append("PANDERA SCHEMA FAILURES:")
+            for fc in report.pandera_failure_cases:
+                feedback_parts.append(
+                    f"  - Column '{fc['column']}': check '{fc['check']}' failed on {fc['violation_count']} rows "
+                    f"(sample failing values: {fc['sample_failures']})"
+                )
+        if report.new_nulls_introduced:
+            feedback_parts.append(f"REGRESSION: Cleaning code introduced new nulls: {report.new_nulls_introduced}")
+        if report.key_conflict_count > 0:
+            feedback_parts.append(f"PRIMARY KEY COLLISION: {report.key_conflict_count} rows violate PK uniqueness: {report.key_conflict_details}")
         if high_sev:
-            return {
-                "error_feedback": f"Validation failed with high severity issues: {str(high_sev)}. Fix the code.",
-                "retry_count": state["retry_count"] + 1,
-                "quality_summary": "High severity anomalies remain.",
-                "validation_report": report.model_dump()
-            }
+            feedback_parts.append(f"HIGH SEVERITY ANOMALIES: {[f['reason'] for f in high_sev]}")
             
+        formatted_feedback = "\n".join(feedback_parts)
+        
+        return {
+            "error_feedback": formatted_feedback,
+            "retry_count": state["retry_count"] + 1,
+            "quality_summary": f"Validation failed with {len(report.escalation_flags)} issues (Pandera passed: {report.pandera_schema_passed}).",
+            "validation_report": report_dict,
+            "quality_after": {"is_valid": False, "summary": "Validation failed", "anomalies": high_sev}
+        }
+        
     return {
         "error_feedback": None,
-        "quality_summary": f"Passed {report.total_passed}/{report.total_checks} checks.",
-        "validation_report": report.model_dump(),
-        # For backward compatibility with older logic just in case:
+        "quality_summary": f"Passed {report.total_passed}/{report.total_checks} checks (Quality Score: {report.data_quality_score_after:.1f}/100, +{report.score_improvement:.1f}%).",
+        "validation_report": report_dict,
         "quality_after": {"is_valid": report.overall_passed, "summary": "Full validation complete", "anomalies": []}
     }
 
-# 4. Report
+
+# ── Final Stage: Report ──────────────────────────────────────────────────────
 def node_report(state: AgentState) -> dict:
+    """Generates the final comprehensive Markdown engineering and quality report."""
     if state.get("error_feedback") and state["retry_count"] >= 3:
         status = "FAILED"
     else:
@@ -131,46 +172,59 @@ def node_report(state: AgentState) -> dict:
         
     generate_report(
         job_id=state["job_id"],
-        plan_json=state["plan_json"],
-        code=state["current_code"],
-        quality_summary=state.get("quality_summary", "Execution failed before validation."),
-        output_path=state["report_file"]
+        plan_json=state.get("plan_json"),
+        code=state.get("current_code"),
+        quality_summary=state.get("quality_summary", "Execution completed."),
+        output_path=state["report_file"],
+        validation_report=state.get("validation_report")
     )
     
     return {"final_status": status}
 
-# Edges
-def route_after_generation(state: AgentState):
+
+# ── Routing Functions (Circuit Breaker) ──────────────────────────────────────
+def route_after_execution(state: AgentState):
     if state.get("error_feedback"):
         if state["retry_count"] >= 3:
             return "report"
-        return "generate_and_execute"
+        return "code"
     return "validate"
 
 def route_after_validation(state: AgentState):
-    if state.get("error_feedback") and state["retry_count"] < 3:
-        return "generate_and_execute"
+    if state.get("error_feedback"):
+        if state["retry_count"] >= 3:
+            return "report"
+        return "code"
     return "report"
 
-# Build Graph
+
+# ── Build 5-Stage LangGraph Loop ─────────────────────────────────────────────
 def build_graph():
+    """
+    Constructs the 5-Stage LangGraph State Machine:
+    Profile → Plan → Code → Execute → Validate (with self-healing circuit breaker) → Report
+    """
     workflow = StateGraph(AgentState)
     
-    workflow.add_node("profile_and_plan", node_profile_and_plan)
-    workflow.add_node("generate_and_execute", node_generate_and_execute)
+    workflow.add_node("profile", node_profile)
+    workflow.add_node("plan", node_plan)
+    workflow.add_node("code", node_code)
+    workflow.add_node("execute", node_execute)
     workflow.add_node("validate", node_validate)
     workflow.add_node("report", node_report)
     
-    workflow.set_entry_point("profile_and_plan")
+    workflow.set_entry_point("profile")
     
-    workflow.add_edge("profile_and_plan", "generate_and_execute")
+    workflow.add_edge("profile", "plan")
+    workflow.add_edge("plan", "code")
+    workflow.add_edge("code", "execute")
     
     workflow.add_conditional_edges(
-        "generate_and_execute",
-        route_after_generation,
+        "execute",
+        route_after_execution,
         {
             "validate": "validate",
-            "generate_and_execute": "generate_and_execute",
+            "code": "code",
             "report": "report"
         }
     )
@@ -179,7 +233,7 @@ def build_graph():
         "validate",
         route_after_validation,
         {
-            "generate_and_execute": "generate_and_execute",
+            "code": "code",
             "report": "report"
         }
     )
@@ -191,7 +245,7 @@ def build_graph():
 
 @traceable(run_type="chain", name="Data Preprocessing Pipeline")
 def run_pipeline(job_id: str, input_file: str, output_file: str, report_file: str) -> dict:
-    """Top-level traceable entry point. Every CSV upload creates one LangSmith trace."""
+    """Top-level traceable entry point. Orchestrates the 5-stage loop."""
     graph = build_graph()
     initial_state: AgentState = {
         "job_id": job_id,

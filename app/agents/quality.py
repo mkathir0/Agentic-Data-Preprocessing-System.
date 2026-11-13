@@ -810,6 +810,15 @@ def run_quality_check(csv_path: str, previous_anomalies: Optional[List[Dict[str,
     return QualityOutput(is_valid=is_valid, anomalies=anomalies, summary=summary)
 
 
+from app.agents.validation_engine import (
+    execute_full_validation_engine,
+    build_dynamic_pandera_schema,
+    validate_pandera_contract,
+    detect_fuzzy_duplicates,
+    detect_key_conflicts,
+    calculate_data_quality_metrics
+)
+
 @traceable
 def run_full_validation(
     input_path: str,
@@ -819,66 +828,13 @@ def run_full_validation(
     plan_actions: Optional[List[dict]] = None
 ) -> ValidationReport:
     """
-    7-category full validation. Compares the cleaned output against the original input.
-    This is called in Phase 4 (node_validate) after execution.
+    Enterprise 7-category full validation with Pandera contract enforcement,
+    fuzzy deduplication, key-conflict detection, and 4-dimensional Data Quality scoring.
     """
-    df_before = load_dataframe(input_path)
-    df_after  = load_dataframe(output_path)
-
-    report = ValidationReport(
-        rows_before=len(df_before),
-        rows_after=len(df_after),
-        cols_before=len(df_before.columns),
-        cols_after=len(df_after.columns),
+    return execute_full_validation_engine(
+        input_path=input_path,
+        output_path=output_path,
+        schema=schema,
+        profiler_before=profiler_before,
+        plan_actions=plan_actions
     )
-
-    # 1. Schema
-    schema_checks, cols_before, cols_after, dropped = check_schema(df_before, df_after, schema)
-    report.schema_checks   = schema_checks
-    report.columns_before  = cols_before
-    report.columns_after   = cols_after
-    report.columns_dropped = dropped
-    report.columns_added   = [c for c in cols_after if c not in cols_before]
-
-    # 2. Range & bounds (on cleaned output)
-    report.range_checks = check_range_bounds(df_after)
-
-    # 3. Cross-field (on cleaned output)
-    cf_checks, biz_violations, miss_patterns = check_cross_field(df_after, schema)
-    report.cross_field_checks       = cf_checks
-    report.business_rule_violations = biz_violations
-    report.missingness_patterns     = miss_patterns
-
-    # 4. Distributional
-    dist_checks, stats_diffs = check_distributional(df_before, df_after, plan_actions)
-    report.distributional_checks = dist_checks
-    report.stats_diff            = stats_diffs
-
-    # 5. Duplicates (on cleaned output)
-    dup_checks, key_dup_total = check_duplicates(df_after, schema)
-    report.duplicate_checks       = dup_checks
-    report.key_based_duplicate_count = key_dup_total
-
-    # 6. Format / encoding (on cleaned output)
-    report.format_checks = check_format_encoding(df_after, schema)
-
-    # 7. Regression
-    reg_checks, new_nulls = check_regression(df_before, df_after, profiler_before)
-    report.regression_checks    = reg_checks
-    report.new_nulls_introduced = new_nulls
-
-    # Escalations
-    report.escalation_flags = compute_escalations(report)
-
-    # Totals
-    all_checks = (
-        report.schema_checks + report.range_checks + report.cross_field_checks +
-        report.distributional_checks + report.duplicate_checks +
-        report.format_checks + report.regression_checks
-    )
-    report.total_checks  = len(all_checks)
-    report.total_passed  = sum(1 for c in all_checks if c.passed)
-    report.total_failed  = sum(1 for c in all_checks if not c.passed)
-    report.overall_passed = report.total_failed == 0
-
-    return report

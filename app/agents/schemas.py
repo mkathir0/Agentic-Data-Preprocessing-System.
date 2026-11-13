@@ -157,3 +157,24 @@ class ValidationReport(BaseModel):
     total_passed: int = 0
     total_failed: int = 0
     overall_passed: bool = True
+
+    # Verifiable Data Quality Metrics (0.0 to 100.0)
+    data_quality_score_before: float = 0.0
+    data_quality_score_after: float = 0.0
+    score_improvement: float = 0.0
+    completeness_score: float = 0.0
+    validity_score: float = 0.0
+    uniqueness_score: float = 0.0
+    consistency_score: float = 0.0
+
+    # Pandera Contract Validation
+    pandera_schema_passed: bool = True
+    pandera_failure_count: int = 0
+    pandera_failure_cases: List[Dict[str, Any]] = Field(default_factory=list)
+
+    # Fuzzy & Key Integrity Metrics
+    fuzzy_duplicate_clusters: int = 0
+    fuzzy_duplicate_examples: List[str] = Field(default_factory=list)
+    key_conflict_count: int = 0
+    key_conflict_details: List[str] = Field(default_factory=list)
+    circuit_breaker_retries: int = 0
