@@ -19,6 +19,7 @@ class Job(Base):
     cleaned_filepath = Column(String, nullable=True)
     cleanup_script_path = Column(String, nullable=True)
     cleaning_plan = Column(JSON, nullable=True)
+    user_instructions = Column(Text, nullable=True)
     profile_report_path = Column(String, nullable=True)
     quality_report_path = Column(String, nullable=True)
     validation_report_path = Column(String, nullable=True)

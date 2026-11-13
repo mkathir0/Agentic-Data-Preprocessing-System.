@@ -84,7 +84,8 @@ def _generate_heuristic_plan(
 def generate_transformation_plan(
     profiler_data: ProfilerOutput,
     quality_data: QualityOutput,
-    schema_data: SchemaOutput
+    schema_data: SchemaOutput,
+    user_instructions: str = None
 ) -> TransformationPlan:
     """
     Uses an LLM to read the deterministic profiling data and output a structured cleaning plan.
@@ -125,13 +126,22 @@ def generate_transformation_plan(
         f"Inferred Types: {schema_data.inferred_types}"
     )
 
+    instructions_block = ""
+    if user_instructions and user_instructions.strip():
+        instructions_block = f"""
+    --- USER CLEANING GOALS & REQUIREMENTS ---
+    The user explicitly requested the following cleaning requirements:
+    "{user_instructions.strip()}"
+    You MUST honor and incorporate these user-specified instructions into the transformation actions.
+"""
+
     prompt = f"""
     You are an expert Data Engineer. You have been provided with deterministic data profiling,
     quality, and schema information for a messy dataset.
 
     Your task is to create a deterministic TransformationPlan to clean this dataset.
     Only suggest transformations that are strongly supported by the data anomalies provided.
-
+{instructions_block}
     --- Profiler Summary ---
     {condensed_profiler}
 

@@ -14,6 +14,15 @@ from app.config import get_settings
 # Create database tables
 Base.metadata.create_all(bind=engine)
 
+# Ensure migrations for dynamic columns in sqlite
+with engine.connect() as conn:
+    from sqlalchemy import text
+    try:
+        conn.execute(text("ALTER TABLE jobs ADD COLUMN user_instructions TEXT;"))
+        conn.commit()
+    except Exception:
+        pass
+
 app = FastAPI(title="AI Data Engineer Backend")
 settings = get_settings()
 

@@ -18,6 +18,7 @@ class AgentState(TypedDict):
     input_file: str
     output_file: str
     report_file: str
+    user_instructions: Optional[str]
     
     # Context (Phase 1 & 2)
     profiler_data: Optional[dict]
@@ -61,8 +62,9 @@ def node_plan(state: AgentState) -> dict:
     p_data = ProfilerOutput.model_validate(state["profiler_data"])
     q_data = QualityOutput.model_validate(state["quality_data"])
     s_data = SchemaOutput.model_validate(state["schema_data"])
+    user_instructions = state.get("user_instructions")
     
-    plan = generate_transformation_plan(p_data, q_data, s_data)
+    plan = generate_transformation_plan(p_data, q_data, s_data, user_instructions=user_instructions)
     
     return {
         "plan_json": plan.model_dump_json()
@@ -246,7 +248,13 @@ def build_graph():
 
 
 @traceable(run_type="chain", name="Data Preprocessing Pipeline")
-def run_pipeline(job_id: str, input_file: str, output_file: str, report_file: str) -> dict:
+def run_pipeline(
+    job_id: str,
+    input_file: str,
+    output_file: str,
+    report_file: str,
+    user_instructions: Optional[str] = None
+) -> dict:
     """Top-level traceable entry point. Orchestrates the 5-stage loop."""
     graph = build_graph()
     initial_state: AgentState = {
@@ -254,6 +262,7 @@ def run_pipeline(job_id: str, input_file: str, output_file: str, report_file: st
         "input_file": input_file,
         "output_file": output_file,
         "report_file": report_file,
+        "user_instructions": user_instructions,
         "profiler_data": None,
         "quality_data": None,
         "schema_data": None,
@@ -276,4 +285,5 @@ def run_pipeline(job_id: str, input_file: str, output_file: str, report_file: st
         "plan_json": result.get("plan_json"),
         "retry_count": result.get("retry_count", 0),
         "quality_summary": result.get("quality_summary"),
+        "current_code": result.get("current_code"),
     }

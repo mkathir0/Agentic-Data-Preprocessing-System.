@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 import httpx
 
-from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -51,6 +51,7 @@ def process_job(job_id: str, db: Session):
             input_file=input_file,
             output_file=output_file,
             report_file=report_file,
+            user_instructions=job.user_instructions,
         )
         
         final_status = result.get("final_status", "FAILED")
@@ -83,6 +84,17 @@ def process_job(job_id: str, db: Session):
 
             job.retry_count = result.get("retry_count", 0)
 
+            # Persist generated Python cleaning code
+            current_code = result.get("current_code")
+            if current_code:
+                script_path = os.path.join(settings.OUTPUT_DIR, f"clean_{job.filename.replace('.csv', '.py')}")
+                try:
+                    with open(script_path, "w") as sf:
+                        sf.write(current_code)
+                    job.cleanup_script_path = script_path
+                except Exception:
+                    pass
+
             if final_status == "FAILED":
                 job.status = "FAILED"
                 job.progress = 100.0
@@ -104,6 +116,7 @@ def process_job(job_id: str, db: Session):
 async def upload_files(
     background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(...),
+    instructions: Optional[str] = Form(None),
     db: Session = Depends(get_db)
 ):
     # Ensure upload directory exists
@@ -125,7 +138,8 @@ async def upload_files(
             original_filepath=file_path,
             status="PENDING",
             current_step="PENDING",
-            progress=0.0
+            progress=0.0,
+            user_instructions=instructions
         )
         db.add(new_job)
         db.commit()
@@ -150,6 +164,17 @@ def get_job_status(job_id: str, db: Session = Depends(get_db)):
     return job
 
 from fastapi.responses import FileResponse
+
+@router.get("/{job_id}/raw")
+def get_raw_csv(job_id: str, db: Session = Depends(get_db)):
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job or not job.original_filepath or not os.path.exists(job.original_filepath):
+        raise HTTPException(status_code=404, detail="Original dataset not found")
+    return FileResponse(
+        path=job.original_filepath,
+        filename=job.filename,
+        media_type='text/csv'
+    )
 
 @router.get("/{job_id}/download")
 def download_cleaned_csv(job_id: str, db: Session = Depends(get_db)):
@@ -193,13 +218,23 @@ def get_insights(job_id: str, db: Session = Depends(get_db)):
     if job.status not in ["COMPLETED", "FAILED"]:
         raise HTTPException(status_code=400, detail="Job not completed yet")
 
+    cleaning_code = None
+    if job.cleanup_script_path and os.path.exists(job.cleanup_script_path):
+        try:
+            with open(job.cleanup_script_path, "r") as sf:
+                cleaning_code = sf.read()
+        except Exception:
+            pass
+
     return {
         "job_id": job.id,
         "filename": job.filename,
+        "user_instructions": job.user_instructions,
         "profiler_data": job.profiler_data,
         "plan_data": job.plan_data,
         "validation_report": job.validation_report,
-        "retry_count": job.retry_count
+        "retry_count": job.retry_count,
+        "cleaning_code": cleaning_code
     }
 
 
