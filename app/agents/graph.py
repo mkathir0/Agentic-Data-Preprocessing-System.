@@ -38,7 +38,16 @@ class AgentState(TypedDict):
     validation_report: Optional[dict]
 
 
+AGENT_ID = os.environ.get("LANGSMITH_AGENT_ID", "agentic-data-preprocessing-pipeline")
+AGENT_ENV = os.environ.get("LANGSMITH_AGENT_ENVIRONMENT", "production")
+
 # ── Stage 1: Profile ─────────────────────────────────────────────────────────
+@traceable(
+    name="Profiler Node",
+    run_type="chain",
+    tags=[AGENT_ID, AGENT_ENV, "stage:profile"],
+    metadata={"agent_id": AGENT_ID, "environment": AGENT_ENV}
+)
 def node_profile(state: AgentState) -> dict:
     """Profiles the raw dataset: computes statistics, infers schema, and scans initial anomalies."""
     input_file = state["input_file"]
@@ -55,6 +64,12 @@ def node_profile(state: AgentState) -> dict:
 
 
 # ── Stage 2: Plan ────────────────────────────────────────────────────────────
+@traceable(
+    name="Planner Node",
+    run_type="chain",
+    tags=[AGENT_ID, AGENT_ENV, "stage:plan"],
+    metadata={"agent_id": AGENT_ID, "environment": AGENT_ENV}
+)
 def node_plan(state: AgentState) -> dict:
     """Uses LLM to create a structured TransformationPlan based purely on deterministic profiling evidence."""
     from app.agents.schemas import ProfilerOutput, QualityOutput, SchemaOutput
@@ -72,6 +87,12 @@ def node_plan(state: AgentState) -> dict:
 
 
 # ── Stage 3: Code (Generate) ────────────────────────────────────────────────
+@traceable(
+    name="Code Generator Node",
+    run_type="chain",
+    tags=[AGENT_ID, AGENT_ENV, "stage:code"],
+    metadata={"agent_id": AGENT_ID, "environment": AGENT_ENV}
+)
 def node_code(state: AgentState) -> dict:
     """Generates executable Python pandas code to satisfy the plan. Receives Pandera feedback if retrying."""
     plan_obj = TransformationPlan.model_validate_json(state["plan_json"])
@@ -88,6 +109,12 @@ def node_code(state: AgentState) -> dict:
 
 
 # ── Stage 4: Execute ────────────────────────────────────────────────────────
+@traceable(
+    name="Executor Node",
+    run_type="chain",
+    tags=[AGENT_ID, AGENT_ENV, "stage:execute"],
+    metadata={"agent_id": AGENT_ID, "environment": AGENT_ENV}
+)
 def node_execute(state: AgentState) -> dict:
     """Safely executes the generated code in an isolated subprocess against the input dataset."""
     code = state["current_code"]
@@ -105,6 +132,12 @@ def node_execute(state: AgentState) -> dict:
 
 
 # ── Stage 5: Validate ───────────────────────────────────────────────────────
+@traceable(
+    name="Validation Node",
+    run_type="chain",
+    tags=[AGENT_ID, AGENT_ENV, "stage:validate"],
+    metadata={"agent_id": AGENT_ID, "environment": AGENT_ENV}
+)
 def node_validate(state: AgentState) -> dict:
     """
     Validates cleaned output using Pandera schema contracts, 7 quality invariant categories,
@@ -167,6 +200,12 @@ def node_validate(state: AgentState) -> dict:
 
 
 # ── Final Stage: Report ──────────────────────────────────────────────────────
+@traceable(
+    name="Reporter Node",
+    run_type="chain",
+    tags=[AGENT_ID, AGENT_ENV, "stage:report"],
+    metadata={"agent_id": AGENT_ID, "environment": AGENT_ENV}
+)
 def node_report(state: AgentState) -> dict:
     """Generates the final comprehensive Markdown engineering and quality report."""
     if state.get("error_feedback") and state["retry_count"] >= 3:
@@ -247,7 +286,17 @@ def build_graph():
     return workflow.compile()
 
 
-@traceable(run_type="chain", name="Data Preprocessing Pipeline")
+@traceable(
+    name="Data Preprocessing Pipeline",
+    run_type="chain",
+    tags=[AGENT_ID, AGENT_ENV, "root-pipeline"],
+    metadata={
+        "agent_id": AGENT_ID,
+        "environment": AGENT_ENV,
+        "endpoint": os.environ.get("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com"),
+        "project": os.environ.get("LANGSMITH_PROJECT", "agentic-data-preprocessing-pipeline"),
+    }
+)
 def run_pipeline(
     job_id: str,
     input_file: str,

@@ -301,7 +301,8 @@ async def get_langsmith_traces(job_id: str, db: Session = Depends(get_db)):
     if not api_key:
         return []
 
-    project_name = os.environ.get("LANGSMITH_PROJECT", "Agentic Data-Preprocessing Pipeline")
+    endpoint = os.environ.get("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com").rstrip("/")
+    project_name = os.environ.get("LANGSMITH_PROJECT", "agentic-data-preprocessing-pipeline")
     headers = {"x-api-key": api_key}
     params = {
         "project_name": project_name,
@@ -312,7 +313,7 @@ async def get_langsmith_traces(job_id: str, db: Session = Depends(get_db)):
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get("https://api.smith.langchain.com/api/v1/runs", headers=headers, params=params)
+            resp = await client.get(f"{endpoint}/api/v1/runs", headers=headers, params=params)
             if resp.status_code != 200:
                 return []
 
@@ -338,7 +339,7 @@ async def get_langsmith_traces(job_id: str, db: Session = Depends(get_db)):
 
             # Fetch child runs
             child_resp = await client.get(
-                "https://api.smith.langchain.com/api/v1/runs",
+                f"{endpoint}/api/v1/runs",
                 headers=headers,
                 params={"parent_run": target_run_id}
             )

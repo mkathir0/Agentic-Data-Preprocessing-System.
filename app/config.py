@@ -18,6 +18,14 @@ class Settings(BaseSettings):
         "http://127.0.0.1:3001",
     ]
 
+    # Observability & LangSmith Tracing
+    LANGSMITH_TRACING: bool = True
+    LANGSMITH_ENDPOINT: str = "https://api.smith.langchain.com"
+    LANGSMITH_PROJECT: str = "agentic-data-preprocessing-pipeline"
+    LANGSMITH_AGENT_ID: str = "agentic-data-preprocessing-pipeline"
+    LANGSMITH_AGENT_ENVIRONMENT: str = "production"
+    LANGSMITH_API_KEY: str = ""
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 def get_settings() -> Settings:

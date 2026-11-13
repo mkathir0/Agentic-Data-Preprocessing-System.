@@ -3,6 +3,7 @@ import re
 import logging
 from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage
+from langsmith import traceable
 
 from app.config import get_settings
 from app.agents.schemas import (
@@ -81,6 +82,7 @@ def _generate_heuristic_plan(
         global_assumptions=["Dataset cleaned using deterministic domain heuristics."]
     )
 
+@traceable(name="Planner Agent (LLM)", run_type="chain")
 def generate_transformation_plan(
     profiler_data: ProfilerOutput,
     quality_data: QualityOutput,

@@ -1,8 +1,10 @@
 import os
 import json
 from typing import Optional, Dict, Any, Union
+from langsmith import traceable
 from app.agents.schemas import ValidationReport
 
+@traceable(name="Reporter Agent", run_type="chain")
 def generate_report(
     job_id: str,
     plan_json: Optional[str],

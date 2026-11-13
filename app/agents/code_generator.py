@@ -3,6 +3,7 @@ import re
 import logging
 from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage
+from langsmith import traceable
 
 from app.config import get_settings
 from app.agents.schemas import TransformationPlan, CodeGenerationOutput
@@ -80,6 +81,7 @@ def _generate_heuristic_code(plan: TransformationPlan = None) -> CodeGenerationO
         dependencies=["pandas", "numpy"]
     )
 
+@traceable(name="Code Generator Agent (LLM)", run_type="chain")
 def generate_cleaning_code(plan: TransformationPlan, error_feedback: str = None, previous_code: str = None) -> CodeGenerationOutput:
     """
     Takes the structured TransformationPlan and generates executable Python pandas code.

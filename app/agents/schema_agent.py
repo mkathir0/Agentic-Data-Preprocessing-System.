@@ -1,9 +1,11 @@
 import pandas as pd
 from typing import Dict
+from langsmith import traceable
 
 from app.agents.schemas import SchemaOutput
 from app.utils.data_loader import load_dataframe
 
+@traceable(name="Schema Agent", run_type="chain")
 def run_schema_inference(csv_path: str) -> SchemaOutput:
     """
     Analyzes the dataframe to infer primary keys, foreign keys, and semantic types.

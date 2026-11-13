@@ -4,6 +4,15 @@ from dotenv import load_dotenv
 # Load .env FIRST so LangSmith SDK reads the vars at import time
 load_dotenv()
 
+# LangSmith Tracing Environment Configuration
+os.environ.setdefault("LANGSMITH_TRACING", "true")
+os.environ.setdefault("LANGCHAIN_TRACING_V2", "true")
+os.environ.setdefault("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
+os.environ.setdefault("LANGSMITH_PROJECT", "agentic-data-preprocessing-pipeline")
+os.environ.setdefault("LANGCHAIN_PROJECT", "agentic-data-preprocessing-pipeline")
+os.environ.setdefault("LANGSMITH_AGENT_ID", "agentic-data-preprocessing-pipeline")
+os.environ.setdefault("LANGSMITH_AGENT_ENVIRONMENT", "production")
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
