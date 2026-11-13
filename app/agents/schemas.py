@@ -57,7 +57,7 @@ class TransformationPlan(BaseModel):
 
 class CodeGenerationOutput(BaseModel):
     code: str = Field(..., description="The executable Python pandas code that performs the actions. Do not include markdown code block syntax like ```python, just the raw code.")
-    dependencies: List[str] = Field(..., description="List of pip packages required to run the code, e.g. ['pandas']")
+    dependencies: List[str] = Field(default_factory=lambda: ["pandas", "numpy"], description="List of pip packages required to run the code, e.g. ['pandas']")
 
 # ── Rich validation report ──────────────────────────────────────────────────
 

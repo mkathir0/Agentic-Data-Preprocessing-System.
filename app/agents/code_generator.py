@@ -48,7 +48,7 @@ def generate_cleaning_code(plan: TransformationPlan, error_feedback: str = None,
 
     # Extract the model name if it starts with groq/
     model_name = settings.LLM_MODEL.replace("groq/", "") if settings.LLM_MODEL.startswith("groq/") else settings.LLM_MODEL
-    candidates = list(dict.fromkeys([model_name, "openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]))
+    candidates = list(dict.fromkeys([model_name, "openai/gpt-oss-120b", "openai/gpt-oss-20b"]))
     
     prompt = f"""
     You are an expert Data Engineer writing production Python code.
@@ -81,21 +81,45 @@ def generate_cleaning_code(plan: TransformationPlan, error_feedback: str = None,
     Return ONLY valid, executable Python code in the 'code' field of the output.
     Ensure that any required imports (like pandas) are included.
     Do NOT include markdown backticks like ```python in the 'code' field.
+
+    CRITICAL: You MUST respond with a valid JSON object matching this schema:
+    {{
+      "code": "import pandas as pd\\n\\ndef clean_data(df: pd.DataFrame) -> pd.DataFrame:\\n    # implementation\\n    return df",
+      "dependencies": ["pandas", "numpy"]
+    }}
     """
     
     messages = [
-        SystemMessage(content="You are a precise data engineering coder."),
+        SystemMessage(content="You are a precise data engineering coder. Always output valid JSON with 'code' and 'dependencies' fields."),
         HumanMessage(content=prompt)
     ]
     
     last_err = None
     for cand in candidates:
         try:
-            llm = ChatGroq(model=cand, temperature=0, api_key=settings.GROQ_API_KEY)
-            structured_llm = llm.with_structured_output(CodeGenerationOutput)
-            code_gen = structured_llm.invoke(messages)
+            llm = ChatGroq(
+                model=cand,
+                temperature=0,
+                api_key=settings.GROQ_API_KEY,
+                model_kwargs={"response_format": {"type": "json_object"}}
+            )
+            resp = llm.invoke(messages)
+            content = resp.content.strip()
+            if content.startswith("```json"):
+                content = content[7:]
+            if content.startswith("```"):
+                content = content[3:]
+            if content.endswith("```"):
+                content = content[:-3]
+            code_gen = CodeGenerationOutput.model_validate_json(content.strip())
             return code_gen
         except Exception as e:
             last_err = e
-            continue
+            try:
+                llm_fallback = ChatGroq(model=cand, temperature=0, api_key=settings.GROQ_API_KEY)
+                structured_llm = llm_fallback.with_structured_output(CodeGenerationOutput)
+                code_gen = structured_llm.invoke(messages)
+                return code_gen
+            except Exception:
+                continue
     raise last_err

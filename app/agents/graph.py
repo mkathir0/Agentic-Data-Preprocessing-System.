@@ -145,6 +145,8 @@ def node_validate(state: AgentState) -> dict:
             feedback_parts.append(f"HIGH SEVERITY ANOMALIES: {[f['reason'] for f in high_sev]}")
             
         formatted_feedback = "\n".join(feedback_parts)
+        if len(formatted_feedback) > 2000:
+            formatted_feedback = formatted_feedback[:2000] + "\n... [truncated to preserve token budget]"
         
         return {
             "error_feedback": formatted_feedback,

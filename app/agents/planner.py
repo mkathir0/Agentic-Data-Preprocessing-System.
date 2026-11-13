@@ -72,7 +72,32 @@ def generate_transformation_plan(
         )
 
     model_name = settings.LLM_MODEL.replace("groq/", "") if settings.LLM_MODEL.startswith("groq/") else settings.LLM_MODEL
-    candidates = list(dict.fromkeys([model_name, "openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]))
+    candidates = list(dict.fromkeys([model_name, "openai/gpt-oss-120b", "openai/gpt-oss-20b"]))
+
+    # Condense profiler and quality data into a compact summary to avoid rate limits (ITPM)
+    lines_p = [
+        f"Rows: {profiler_data.num_rows:,}, Columns: {profiler_data.num_columns}",
+        f"Missing cells: {profiler_data.missing_cells:,} ({profiler_data.missing_cells_percentage:.1f}%)",
+        f"Duplicate rows: {profiler_data.duplicate_rows:,} ({profiler_data.duplicate_rows_percentage:.1f}%)",
+        "Columns:"
+    ]
+    for col, ctype in profiler_data.column_types.items():
+        c_sum = profiler_data.columns_summary.get(col, {})
+        n_miss = c_sum.get("n_missing", 0)
+        lines_p.append(f"  - {col} ({ctype}): {n_miss} nulls")
+    condensed_profiler = "\n".join(lines_p)
+
+    lines_q = [f"Summary: {quality_data.summary}", "Detected Anomalies:"]
+    for a in quality_data.anomalies:
+        lines_q.append(f"  - [{a.severity.upper()}] {a.column or 'DATASET'}: {a.anomaly_type} - {a.description}")
+    condensed_quality = "\n".join(lines_q)
+
+    condensed_schema = (
+        f"Primary Keys: {schema_data.primary_keys}\n"
+        f"Categorical Columns: {schema_data.categorical_columns}\n"
+        f"Datetime Columns: {schema_data.datetime_columns}\n"
+        f"Inferred Types: {schema_data.inferred_types}"
+    )
 
     prompt = f"""
     You are an expert Data Engineer. You have been provided with deterministic data profiling,
@@ -81,14 +106,14 @@ def generate_transformation_plan(
     Your task is to create a deterministic TransformationPlan to clean this dataset.
     Only suggest transformations that are strongly supported by the data anomalies provided.
 
-    --- Profiler Data ---
-    {profiler_data.model_dump_json(indent=2)}
+    --- Profiler Summary ---
+    {condensed_profiler}
 
-    --- Quality Data (Anomalies) ---
-    {quality_data.model_dump_json(indent=2)}
+    --- Quality Anomalies ---
+    {condensed_quality}
 
     --- Schema Inference ---
-    {schema_data.model_dump_json(indent=2)}
+    {condensed_schema}
 
     CRITICAL INSTRUCTIONS FOR ANOMALIES:
     You MUST propose a fix for ALL anomalies reported in the Quality Data. Do not ignore them!
@@ -118,22 +143,54 @@ def generate_transformation_plan(
     - `global_assumptions`: A list of any high-level assumptions that apply across multiple steps
       (e.g. "This appears to be a bike-share trip dataset", "Duplicate IDs appear to be true duplicates not re-used keys")
 
-    Generate a TransformationPlan now.
+    CRITICAL: You MUST respond ONLY with a valid JSON object matching this schema:
+    {{
+      "dataset_summary": "1-2 sentence overview of dataset issues",
+      "global_assumptions": ["assumption 1", "assumption 2"],
+      "actions": [
+        {{
+          "action_type": "strip_whitespace",
+          "column": "column_name or null",
+          "explanation": "why this action is needed",
+          "confidence": "high",
+          "assumption": "assumption text or null",
+          "estimated_rows_affected_pct": 0.05
+        }}
+      ]
+    }}
     """
 
     messages = [
-        SystemMessage(content="You are a precise data engineering planner. Always fill in the confidence, assumption, and estimated_rows_affected_pct fields — never leave them missing."),
+        SystemMessage(content="You are a precise data engineering planner. Always output valid JSON matching the requested schema. Fill in confidence, assumption, and estimated_rows_affected_pct fields."),
         HumanMessage(content=prompt)
     ]
 
     last_err = None
     for cand in candidates:
         try:
-            llm = ChatGroq(model=cand, temperature=0, api_key=settings.GROQ_API_KEY)
-            structured_llm = llm.with_structured_output(TransformationPlan)
-            plan = structured_llm.invoke(messages)
+            llm = ChatGroq(
+                model=cand,
+                temperature=0,
+                api_key=settings.GROQ_API_KEY,
+                model_kwargs={"response_format": {"type": "json_object"}}
+            )
+            resp = llm.invoke(messages)
+            content = resp.content.strip()
+            if content.startswith("```json"):
+                content = content[7:]
+            if content.startswith("```"):
+                content = content[3:]
+            if content.endswith("```"):
+                content = content[:-3]
+            plan = TransformationPlan.model_validate_json(content.strip())
             return plan
         except Exception as e:
             last_err = e
-            continue
+            try:
+                llm_fallback = ChatGroq(model=cand, temperature=0, api_key=settings.GROQ_API_KEY)
+                structured_llm = llm_fallback.with_structured_output(TransformationPlan)
+                plan = structured_llm.invoke(messages)
+                return plan
+            except Exception:
+                continue
     raise last_err
