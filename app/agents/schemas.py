@@ -13,6 +13,7 @@ class ProfilerOutput(BaseModel):
     duplicate_rows_percentage: float
     column_types: Dict[str, str]       # e.g. {"age": "Numeric", "name": "Text"}
     columns_summary: Dict[str, Any]    # Detailed summary per column
+    candidate_transformations: List[Dict[str, Any]] = Field(default_factory=list)
 
 # ── Quality anomaly (light) ─────────────────────────────────────────────────
 
@@ -47,6 +48,7 @@ class TransformationAction(BaseModel):
     confidence: Literal["high", "medium", "low"] = Field("medium", description="Confidence that this transformation is correct: high=well-supported by statistics, medium=reasonable heuristic, low=uncertain/may alter data meaning")
     assumption: Optional[str] = Field(None, description="Any assumption the LLM made to justify this action, in plain English (e.g. 'assumed missing station data = dockless rides')")
     estimated_rows_affected_pct: Optional[float] = Field(None, description="Estimated percentage of rows affected by this action, 0.0-1.0")
+    parameters: Dict[str, Any] = Field(default_factory=dict, description="Explicit parser or normalization parameters derived from deterministic evidence")
 
 class TransformationPlan(BaseModel):
     dataset_summary: str = Field(..., description="A short summary of the dataset state based on the profiling data")
@@ -116,6 +118,10 @@ class EscalationFlag(BaseModel):
     severity: Literal["high", "medium", "low"]
 
 class ValidationReport(BaseModel):
+    integrity_passed: bool = False
+    review_required: bool = False
+    review_reasons: List[str] = Field(default_factory=list)
+
     """Full 7-layer validation report for a single pipeline run."""
     # 1. Schema
     schema_checks: List[ValidationCheck] = Field(default_factory=list)

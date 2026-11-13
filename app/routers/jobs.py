@@ -1,15 +1,21 @@
 import os
 import shutil
 import asyncio
+import json
+import logging
+import uuid
+import mimetypes
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import httpx
 
-from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException
 from sqlalchemy.orm import Session
 
-from app.database import get_db
+from app.database import get_db, SessionLocal
+from app.job_artifacts import artifact_paths
 from app.models import Job
+from app.job_queue import enqueue_job
 from app.schemas import JobResponse, JobUploadResponse
 from app.config import settings
 
@@ -23,7 +29,14 @@ router = APIRouter(
 
 from app.agents.graph import run_pipeline
 
-def process_job(job_id: str, db: Session):
+def process_job(job_id: str, db: Session = None):
+    if db is not None:
+        return _process_job(job_id, db)
+    with SessionLocal() as worker_db:
+        return _process_job(job_id, worker_db)
+
+
+def _process_job(job_id: str, db: Session):
     def update_status(prog: float, status: str = "PROCESSING", err: str = None, cleaned_file: str = None):
         job = db.query(Job).filter(Job.id == job_id).first()
         if job:
@@ -40,8 +53,15 @@ def process_job(job_id: str, db: Session):
         return
     
     input_file = job.original_filepath
-    output_file = os.path.join(settings.OUTPUT_DIR, f"cleaned_{job.filename}")
-    report_file = os.path.join(settings.OUTPUT_DIR, f"report_{job.filename.replace('.csv', '.md')}")
+    artifacts = artifact_paths(settings.OUTPUT_DIR, job.id, job.filename)
+    artifacts['directory'].mkdir(parents=True, exist_ok=True)
+    output_file = str(artifacts['cleaned'])
+    report_file = str(artifacts['report'])
+    job.cleaned_filepath = None
+    job.profile_report_path = None
+    job.cleanup_script_path = None
+    job.quality_report_path = None
+    job.validation_report_path = None
     
     update_status(10.0, "PROCESSING")
     
@@ -87,46 +107,44 @@ def process_job(job_id: str, db: Session):
             # Persist generated Python cleaning code
             current_code = result.get("current_code")
             if current_code:
-                script_path = os.path.join(settings.OUTPUT_DIR, f"clean_{job.filename.replace('.csv', '.py')}")
-                try:
-                    with open(script_path, "w") as sf:
-                        sf.write(current_code)
-                    job.cleanup_script_path = script_path
-                except Exception:
-                    pass
+                script_path = str(artifacts['script'])
+                Path(script_path).write_text(current_code, encoding="utf-8")
+                job.cleanup_script_path = script_path
 
-            has_valid_output = os.path.exists(output_file) and os.path.getsize(output_file) > 0
-            if has_valid_output:
+            report = result.get("validation_report") or {}
+            has_output = os.path.isfile(output_file) and os.path.getsize(output_file) > 0
+            integrity_passed = report.get("integrity_passed") is True
+            validated = report.get("overall_passed") is True and integrity_passed
+            job.progress = 100.0
+            job.cleaned_filepath = output_file if has_output and integrity_passed else None
+            job.profile_report_path = report_file if os.path.isfile(report_file) else None
+            job.quality_report_path = str(artifacts['suite']) if os.path.isfile(artifacts['suite']) else None
+            job.validation_report_path = str(artifacts['validation']) if os.path.isfile(artifacts['validation']) else None
+            if final_status == "COMPLETED" and has_output and validated:
                 job.status = "COMPLETED"
-                job.progress = 100.0
+                job.current_step = "COMPLETED"
                 job.error_message = None
-                job.cleaned_filepath = output_file
-                if os.path.exists(report_file):
-                    job.profile_report_path = report_file
-                if final_status == "FAILED":
-                    job.current_step = "REVIEW_FLAGGED"
-                else:
-                    job.current_step = "COMPLETED"
-            elif final_status == "FAILED":
-                job.status = "FAILED"
-                job.progress = 100.0
-                job.error_message = "Validation or execution failed after max retries."
             else:
-                job.status = "COMPLETED"
-                job.progress = 100.0
-                job.error_message = None
-                job.cleaned_filepath = output_file
-                if os.path.exists(report_file):
-                    job.profile_report_path = report_file
+                job.status = "FAILED"
+                if has_output and integrity_passed:
+                    job.current_step = "REVIEW_FLAGGED"
+                    job.error_message = "Records were preserved, but validation or planned actions require human review. Output is not approved for production."
+                else:
+                    job.current_step = "VALIDATION_FAILED" if has_output else "EXECUTION_FAILED"
+                    job.error_message = "Output failed integrity checks or execution did not produce a verified dataset."
             db.commit()
             
     except Exception as e:
+        db.rollback()
+        failed_job = db.query(Job).filter(Job.id == job_id).first()
+        if failed_job:
+            failed_job.cleaned_filepath = None
+            failed_job.current_step = "EXECUTION_FAILED"
         update_status(100.0, status="FAILED", err=str(e))
 
 
 @router.post("/upload", response_model=List[JobUploadResponse])
 async def upload_files(
-    background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(...),
     instructions: Optional[str] = Form(None),
     db: Session = Depends(get_db)
@@ -138,7 +156,17 @@ async def upload_files(
     new_jobs = []
     
     for file in files:
-        file_path = os.path.join(settings.UPLOAD_DIR, file.filename)
+        name = file.filename or ""
+        if not name or name in {".", ".."} or any(c in name for c in ("/", "\\", "\x00")):
+            raise HTTPException(status_code=400, detail="Use a plain filename without directory components.")
+        if Path(name).suffix.lower() not in {".csv", ".tsv", ".json", ".xlsx", ".xls", ".parquet"}:
+            raise HTTPException(status_code=400, detail="Unsupported dataset format.")
+
+    for file in files:
+        job_id = str(uuid.uuid4())
+        upload_dir = Path(settings.UPLOAD_DIR) / job_id
+        upload_dir.mkdir(parents=True, exist_ok=False)
+        file_path = str(upload_dir / file.filename)
         
         # Save the file
         with open(file_path, "wb") as buffer:
@@ -146,6 +174,7 @@ async def upload_files(
 
         # Create job in database
         new_job = Job(
+            id=job_id,
             filename=file.filename,
             original_filepath=file_path,
             status="PENDING",
@@ -154,12 +183,10 @@ async def upload_files(
             user_instructions=instructions
         )
         db.add(new_job)
+        enqueue_job(db, job_id)
         db.commit()
         db.refresh(new_job)
         new_jobs.append(new_job)
-
-        # Start execution task
-        background_tasks.add_task(process_job, new_job.id, db)
 
     return new_jobs
 
@@ -185,7 +212,7 @@ def get_raw_csv(job_id: str, db: Session = Depends(get_db)):
     return FileResponse(
         path=job.original_filepath,
         filename=job.filename,
-        media_type='text/csv'
+        media_type=mimetypes.guess_type(job.filename)[0] or 'application/octet-stream'
     )
 
 @router.get("/{job_id}/download")
@@ -199,10 +226,12 @@ def download_cleaned_csv(job_id: str, db: Session = Depends(get_db)):
         
     if not job.cleaned_filepath or not os.path.exists(job.cleaned_filepath):
         raise HTTPException(status_code=404, detail="Cleaned file not found")
+    if not (job.validation_report or {}).get("integrity_passed"):
+        raise HTTPException(status_code=409, detail="This output has not passed integrity verification. Re-run the dataset before using it.")
         
     return FileResponse(
         path=job.cleaned_filepath, 
-        filename=f"cleaned_{job.filename}", 
+        filename=f"{'cleaned' if job.status == 'COMPLETED' else 'review_candidate'}_{Path(job.filename).stem}.csv",
         media_type='text/csv'
     )
 
@@ -213,10 +242,32 @@ def get_report(job_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Job not found")
     if job.status not in ["COMPLETED", "FAILED"]:
         raise HTTPException(status_code=400, detail="Job is not completed yet")
-    report_file = os.path.join(settings.OUTPUT_DIR, f"report_{job.filename.replace('.csv', '.md')}")
-    if not os.path.exists(report_file):
+    report_file = job.profile_report_path
+    if not report_file or not os.path.isfile(report_file):
         raise HTTPException(status_code=404, detail="Report not found")
     return FileResponse(path=report_file, filename=os.path.basename(report_file), media_type='text/markdown')
+
+
+@router.get("/{job_id}/quality-suite")
+def get_quality_suite(job_id: str, db: Session = Depends(get_db)):
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    suite_path = job.quality_report_path
+    if not suite_path or not os.path.isfile(suite_path):
+        raise HTTPException(status_code=404, detail="Great Expectations suite not found")
+    return FileResponse(path=suite_path, filename=os.path.basename(suite_path), media_type="application/json")
+
+
+@router.get("/{job_id}/validation-report")
+def get_validation_report(job_id: str, db: Session = Depends(get_db)):
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    report_path = job.validation_report_path
+    if not report_path or not os.path.isfile(report_path):
+        raise HTTPException(status_code=404, detail="Validation report not found")
+    return FileResponse(path=report_path, filename=os.path.basename(report_path), media_type="application/json")
 
 @router.get("/{job_id}/insights")
 def get_insights(job_id: str, db: Session = Depends(get_db)):
@@ -309,140 +360,6 @@ def build_run_message(agent_name: str, run: dict, duration_ms: int) -> str:
     return f"{agent_name} completed successfully in {duration_ms}ms"
 
 
-def _build_local_agent_traces(job: Job) -> List[Dict[str, Any]]:
-    """
-    Constructs high-fidelity execution traces across all agent stages.
-    Used when LANGSMITH_API_KEY is not yet configured or when offline,
-    ensuring full observability into agent actions, timings, and outputs.
-    """
-    from datetime import datetime
-    events = []
-    base_time = job.created_at or datetime.utcnow()
-    t_str = base_time.isoformat()
-    
-    # 1. Root Pipeline
-    events.append({
-        "id": f"{job.id}-pipeline",
-        "agent": "Pipeline",
-        "level": "error" if job.status == "FAILED" else "info",
-        "message": f"Data Preprocessing Pipeline: Root execution orchestrating autonomous cleaning for {job.filename} (Status: {job.status})",
-        "timestamp": t_str,
-        "duration_ms": int((job.updated_at - job.created_at).total_seconds() * 1000) if (job.updated_at and job.created_at) else 1250,
-        "tags": ["agentic-data-preprocessing-pipeline", "production", "root-pipeline"],
-        "inputs": {"job_id": job.id, "filename": job.filename},
-        "outputs": {"status": job.status, "progress": job.progress}
-    })
-    
-    # 2. ProfilerAgent
-    pd = job.profiler_data or {}
-    n_rows = pd.get("num_rows", 0)
-    n_cols = pd.get("num_columns", 0)
-    events.append({
-        "id": f"{job.id}-profiler",
-        "agent": "ProfilerAgent",
-        "level": "info",
-        "message": f"ProfilerAgent: Profiled dataset structure ({n_rows:,} rows, {n_cols} columns, {pd.get('missing_cells', 0):,} missing cells)",
-        "timestamp": t_str,
-        "duration_ms": 420,
-        "tags": ["profiler", "production", "stage:profile"],
-        "inputs": {"filename": job.filename},
-        "outputs": {"num_rows": n_rows, "num_columns": n_cols}
-    })
-    
-    # 3. SchemaAgent
-    events.append({
-        "id": f"{job.id}-schema",
-        "agent": "SchemaAgent",
-        "level": "info",
-        "message": f"SchemaAgent: Inferred semantic types, primary keys, and datetime columns across {n_cols} features",
-        "timestamp": t_str,
-        "duration_ms": 310,
-        "tags": ["schema", "production", "stage:profile"],
-        "inputs": {"columns": list(pd.get("column_types", {}).keys())},
-        "outputs": {"types": pd.get("column_types", {})}
-    })
-    
-    # 4. PlannerAgent
-    plan = job.plan_data or {}
-    actions = plan.get("actions", [])
-    events.append({
-        "id": f"{job.id}-planner",
-        "agent": "PlannerAgent",
-        "level": "info",
-        "message": f"PlannerAgent: Formulated deterministic TransformationPlan with {len(actions)} cleaning operations",
-        "timestamp": t_str,
-        "duration_ms": 1150,
-        "tags": ["planner", "production", "stage:plan", "llm-plan"],
-        "inputs": {"anomalies_detected": len(actions)},
-        "outputs": {"actions_count": len(actions)}
-    })
-    
-    # 5. CodeGeneratorAgent
-    has_code = bool(job.cleanup_script_path and os.path.exists(job.cleanup_script_path))
-    events.append({
-        "id": f"{job.id}-codegen",
-        "agent": "CodeGeneratorAgent",
-        "level": "info",
-        "message": f"CodeGeneratorAgent: Synthesized production pandas cleaning script clean_{job.filename.replace('.csv', '.py')}",
-        "timestamp": t_str,
-        "duration_ms": 1820,
-        "tags": ["code_generator", "production", "stage:code", "llm-code"],
-        "inputs": {"plan_actions": len(actions)},
-        "outputs": {"script_ready": has_code}
-    })
-    
-    # 6. ExecutorAgent
-    retries = int(job.retry_count or 0)
-    exec_level = "warning" if retries > 0 else "info"
-    events.append({
-        "id": f"{job.id}-executor",
-        "agent": "ExecutorAgent",
-        "level": exec_level,
-        "message": f"ExecutorAgent: Executed pandas transformations in sandbox subprocess ({retries} self-healing retry iterations)",
-        "timestamp": t_str,
-        "duration_ms": 890,
-        "tags": ["executor", "production", "stage:execute"],
-        "inputs": {"retries": retries},
-        "outputs": {"output_file": job.cleaned_filepath}
-    })
-    
-    # 7. ValidationEngine
-    vr = job.validation_report or {}
-    t_pass = vr.get("total_passed", 0)
-    t_checks = vr.get("total_checks", 0)
-    dq_after = vr.get("data_quality_score_after", 0)
-    val_level = "error" if (job.status == "FAILED" and vr.get("key_conflict_count", 0) > 0) else "info"
-    val_msg = f"ValidationEngine: Executed 7-layer invariants ({t_pass}/{t_checks} passed, Quality: {dq_after:.1f}/100)"
-    if vr.get("key_conflict_count", 0) > 0:
-        val_msg += f" · Preserved {vr['key_conflict_count']} primary key collisions for human review"
-    events.append({
-        "id": f"{job.id}-validator",
-        "agent": "ValidationEngine",
-        "level": val_level,
-        "message": val_msg,
-        "timestamp": t_str,
-        "duration_ms": 640,
-        "tags": ["validator", "production", "stage:validate", "pandera-contract"],
-        "inputs": {"total_checks": t_checks},
-        "outputs": {"score_after": dq_after, "overall_passed": vr.get("overall_passed")}
-    })
-    
-    # 8. ReporterAgent
-    events.append({
-        "id": f"{job.id}-reporter",
-        "agent": "ReporterAgent",
-        "level": "info",
-        "message": f"ReporterAgent: Published executive markdown engineering quality and audit report",
-        "timestamp": t_str,
-        "duration_ms": 250,
-        "tags": ["reporter", "production", "stage:report"],
-        "inputs": {"report_format": "markdown"},
-        "outputs": {"published": True}
-    })
-    
-    return events
-
-
 @router.get("/{job_id}/langsmith-traces")
 async def get_langsmith_traces(job_id: str, db: Session = Depends(get_db)):
     job = db.query(Job).filter(Job.id == job_id).first()
@@ -451,7 +368,7 @@ async def get_langsmith_traces(job_id: str, db: Session = Depends(get_db)):
 
     api_key = os.environ.get("LANGSMITH_API_KEY") or os.environ.get("LANGCHAIN_API_KEY")
     if not api_key:
-        return _build_local_agent_traces(job)
+        raise HTTPException(status_code=503, detail="LangSmith is not configured: API key is missing.")
 
     endpoint = os.environ.get("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com").rstrip("/")
     project_name = os.environ.get("LANGSMITH_PROJECT", "agentic-data-preprocessing-pipeline")
@@ -460,21 +377,31 @@ async def get_langsmith_traces(job_id: str, db: Session = Depends(get_db)):
         from app.langsmith_queries import fetch_job_runs
         runs = await fetch_job_runs(job_id, job.created_at, endpoint, api_key, project_name)
         if not runs:
-            return _build_local_agent_traces(job)
+            return []
 
         events = []
-        for r in runs:
+        for r in sorted(runs, key=lambda run: (run.start_time, str(run.id))):
             agent_name = map_run_to_agent_name(r.name or "")
-            dur_ms = int((r.end_time - r.start_time).total_seconds() * 1000) if (r.end_time and r.start_time) else 0
+            dur_ms = int((r.end_time - r.start_time).total_seconds() * 1000) if (r.end_time and r.start_time) else None
             if r.error:
                 msg = f"Error in {agent_name}: {r.error}"
                 level = "error"
+                status = "error"
+            elif r.end_time is None:
+                msg = f"{agent_name}: completion has not yet been received by LangSmith"
+                level = "warning"
+                status = "pending"
             else:
                 msg = f"{agent_name} executed in {dur_ms}ms"
                 level = "info"
+                status = "completed"
 
             events.append({
                 "id": str(r.id),
+                "trace_id": str(r.trace_id),
+                "parent_run_id": str(r.parent_run_ids[-1]) if r.parent_run_ids else None,
+                "source": "langsmith",
+                "status": status,
                 "agent": agent_name,
                 "level": level,
                 "message": msg,
@@ -485,8 +412,9 @@ async def get_langsmith_traces(job_id: str, db: Session = Depends(get_db)):
                 "outputs": r.outputs or {}
             })
         return events
-    except Exception:
-        return _build_local_agent_traces(job)
+    except Exception as exc:
+        logging.getLogger(__name__).exception("LangSmith query failed for job %s", job_id)
+        raise HTTPException(status_code=502, detail="Could not retrieve LangSmith traces. Please retry.") from exc
 
 
 @router.get("/{job_id}/summary")
@@ -496,27 +424,27 @@ def get_job_summary(job_id: str, db: Session = Depends(get_db)):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    report_file = os.path.join(settings.OUTPUT_DIR, f"report_{job.filename.replace('.csv', '.md')}")
-    report_exists = os.path.exists(report_file)
+    report_file = job.profile_report_path
+    report_exists = bool(report_file and os.path.isfile(report_file))
 
     phases = [
         {
             "phase": "Profiling & Analysis",
             "agent": "ProfilerAgent / QualityAgent / SchemaAgent",
-            "status": "COMPLETED" if job.status in ["PROCESSING", "COMPLETED", "FAILED"] else "PENDING",
+            "status": "COMPLETED" if job.profiler_data is not None else ("PROCESSING" if job.status == "PROCESSING" else "PENDING"),
             "details": "Dataset profiling, Pandera data quality checks, and schema inference."
         },
         {
             "phase": "Transformation Planning",
             "agent": "PlannerAgent",
-            "status": "COMPLETED" if job.status in ["COMPLETED", "FAILED"] and job.cleaning_plan else ("PROCESSING" if job.status == "PROCESSING" else "PENDING"),
-            "details": job.cleaning_plan if job.cleaning_plan else "Generates deterministic transformation plan from profiling findings."
+            "status": "COMPLETED" if job.status in ["COMPLETED", "FAILED"] and job.plan_data else ("PROCESSING" if job.status == "PROCESSING" else "PENDING"),
+            "details": str(job.plan_data) if job.plan_data else "Generates deterministic transformation plan from profiling findings."
         },
         {
             "phase": "Code Generation & Execution",
             "agent": "CodeGeneratorAgent / ExecutorAgent",
             "status": "COMPLETED" if job.status == "COMPLETED" else ("FAILED" if job.status == "FAILED" else "PENDING"),
-            "details": "Generates Pandas cleaning script and executes in isolated environment with automatic retry."
+            "details": "Generates a cleaning script and executes it in a subprocess with timeout protection and automatic retry."
         },
         {
             "phase": "Validation & Verification",

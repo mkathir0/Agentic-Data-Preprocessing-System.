@@ -1,9 +1,10 @@
+import re
 import pandas as pd
 from typing import Dict
 from langsmith import traceable
 
 from app.agents.schemas import SchemaOutput
-from app.utils.data_loader import load_dataframe
+from app.utils.data_loader import load_dataframe, is_identifier_column
 
 @traceable(name="Schema Agent", run_type="chain")
 def run_schema_inference(csv_path: str) -> SchemaOutput:
@@ -36,13 +37,13 @@ def run_schema_inference(csv_path: str) -> SchemaOutput:
         num_unique = non_null_series.nunique()
 
         # 1. Primary Key Inference (High cardinality, unique, typically ID or hash)
-        if num_non_null > 0 and num_unique == num_non_null and ('id' in col.lower() or 'key' in col.lower() or 'uuid' in col.lower() or num_unique == num_rows):
+        if is_identifier_column(col) and num_non_null == num_rows and num_unique / max(num_rows, 1) >= 0.90:
             primary_keys.append(col)
             inferred_types[col] = "Identifier"
             continue # Don't classify PKs as categorical or FKs easily
 
         # 2. Foreign Key Inference (Has ID in name, but not unique)
-        if ('id' in col.lower() or '_key' in col.lower()) and num_unique < num_non_null:
+        if is_identifier_column(col) and num_unique < num_non_null:
             candidate_fks.append(col)
             inferred_types[col] = "Foreign Key"
 
@@ -50,7 +51,7 @@ def run_schema_inference(csv_path: str) -> SchemaOutput:
         if pd.api.types.is_datetime64_any_dtype(series):
             datetime_columns.append(col)
             inferred_types[col] = "Datetime"
-        elif series.dtype == 'object':
+        elif (series.dtype == 'object' or pd.api.types.is_string_dtype(series)) and re.search(r'date|time|_at$', col, re.I) and num_non_null > 0:
             # Attempt a quick parse to see if it's mostly datetime
             try:
                 # Sample a few rows to speed up, or just try on non-null

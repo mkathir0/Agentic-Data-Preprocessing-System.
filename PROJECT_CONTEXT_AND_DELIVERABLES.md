@@ -8,10 +8,11 @@ Unlike simple LLM wrappers, this system acts like a junior data engineer: it **o
 - **Backend:** FastAPI, Python (using `uv` for environment management)
 - **Frontend:** React
 - **Orchestration:** LangGraph (stateful loops for Observe -> Plan -> Execute -> Validate)
+- **Job Execution:** Database-backed queue with renewable worker leases; a separate worker process reclaims jobs after a crash
 - **LLM Routing:** LiteLLM (Claude / GPT-4o / Gemini)
 - **Data Tools:** Pandas, Polars, ydata-profiling, Great Expectations, Pandera, sqlglot
 - **State/Database:** PostgreSQL / SQLite
-- **Execution Environment:** Docker Sandbox or Python Subprocess
+- **Execution Environment:** macOS Seatbelt or Linux Docker sandbox; generated-code execution fails closed when OS restrictions are unavailable
 
 ## 3. The 5 Deliverables
 
@@ -33,13 +34,13 @@ Unlike simple LLM wrappers, this system acts like a junior data engineer: it **o
 
 ### Deliverable 4: Execution & Validation
 *Goal: Safely execute the generated code and verify the results.*
-- **Execution Agent:** Runs the generated Python script against the raw CSV in an isolated Python subprocess or Docker sandbox. Outputs `cleaned.csv`.
+- **Execution Agent:** Runs the generated Python script against a fresh copy of the raw CSV in an OS-restricted workspace (macOS Seatbelt or Linux Docker). Outputs a candidate `cleaned.csv` only after the sandbox exits successfully.
 - **Validation Agent:** Re-runs the `Great Expectations` checks against the cleaned CSV to verify improvements and ensure the script did not break the data.
 
 ### Deliverable 5: Orchestration & Reporting
 *Goal: Tie all agents into a continuous, autonomous loop.*
 - **LangGraph Orchestrator:** Wire the agents together into the core loop: `Observe → Plan → Generate → Execute → Validate`.
-- **Escalation Logic:** Add a circuit breaker to loop back to the Planner if validation fails, and flag for "Human Review Required" if retries are exhausted.
+- **Escalation Logic:** Add a circuit breaker to loop back to the Planner if validation fails, and flag for "Human Review Required" when decisions remain ambiguous or retries are exhausted.
 - **Reporting Agent:** Generate final `engineering_report.md` and `validation_report.md` artifacts.
 
 ---

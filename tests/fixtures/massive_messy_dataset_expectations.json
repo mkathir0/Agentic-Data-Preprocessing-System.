@@ -1,0 +1,304 @@
+{
+  "fixture": "massive_messy_dataset.csv",
+  "source": "uploads/massive_messy_dataset.csv",
+  "generator": "generate_messy_dataset.py",
+  "seed": 42,
+  "expected_input_rows": 20470,
+  "expected_columns": 22,
+  "permitted_transformations": {
+    "trim_leading_trailing_whitespace": true,
+    "remove_whole_row_exact_duplicates": true,
+    "expected_exact_duplicate_rows_removed": 350,
+    "normalize_numeric_format_columns": [
+      "unit_price",
+      "quantity",
+      "discount_pct",
+      "line_subtotal",
+      "grand_total"
+    ],
+    "normalize_datetime_columns": [
+      "order_date",
+      "ship_date"
+    ],
+    "normalize_boolean_columns": [
+      "is_expedited_shipping"
+    ],
+    "normalize_case_only_categories": [
+      "customer_city",
+      "customer_country",
+      "product_category",
+      "payment_method",
+      "delivery_status"
+    ]
+  },
+  "forbidden_transformations_without_domain_rules": [
+    "impute_or_remove_missing_values",
+    "rewrite_or_drop_invalid_emails",
+    "reinterpret_or_correct_dates",
+    "correct_arithmetic_mismatches",
+    "clip_or_remove_outliers",
+    "merge_or_remove_conflicting_transaction_ids",
+    "drop_or_add_columns",
+    "add_or_remove_nonduplicate_records",
+    "alter_arithmetic_or_temporal_contradictions",
+    "fuzzy_merge_city_or_country_aliases",
+    "impute_values_or_correct_outliers"
+  ],
+  "required_validation_findings": [
+    {
+      "id": "invalid_email_format",
+      "source": "checks",
+      "fields": [
+        "schema_checks"
+      ],
+      "signal": "customer_email",
+      "minimum_violations": 1
+    },
+    {
+      "id": "missing_values",
+      "source": "stats_diff",
+      "column": "customer_email",
+      "minimum_null_fraction": 0.01
+    },
+    {
+      "id": "transaction_id_collisions",
+      "source": "checks",
+      "fields": [
+        "duplicate_checks"
+      ],
+      "signal": "transaction_id",
+      "minimum_violations": 1
+    },
+    {
+      "id": "order_before_ship_violations",
+      "source": "checks",
+      "fields": [
+        "cross_field_checks"
+      ],
+      "signal": "ship_date' >= 'order_date",
+      "minimum_violations": 1
+    },
+    {
+      "id": "delivery_before_ship_violations",
+      "source": "checks",
+      "fields": [
+        "cross_field_checks"
+      ],
+      "signal": "delivery_date' >= 'ship_date",
+      "minimum_violations": 1
+    },
+    {
+      "id": "line_subtotal_arithmetic_mismatch",
+      "source": "checks",
+      "fields": [
+        "cross_field_checks"
+      ],
+      "signal": "matches line_subtotal",
+      "minimum_violations": 1
+    },
+    {
+      "id": "grand_total_arithmetic_mismatch",
+      "source": "checks",
+      "fields": [
+        "cross_field_checks"
+      ],
+      "signal": "matches grand_total",
+      "minimum_violations": 1
+    },
+    {
+      "id": "negative_prices",
+      "source": "checks",
+      "fields": [
+        "range_checks"
+      ],
+      "signal": "unit_price' within",
+      "minimum_violations": 1
+    },
+    {
+      "id": "negative_or_malformed_quantities",
+      "source": "checks",
+      "fields": [
+        "range_checks"
+      ],
+      "signal": "quantity' within",
+      "minimum_violations": 1
+    },
+    {
+      "id": "discount_out_of_bounds",
+      "source": "checks",
+      "fields": [
+        "range_checks"
+      ],
+      "signal": "discount_pct' within",
+      "minimum_violations": 1
+    },
+    {
+      "id": "rating_out_of_bounds",
+      "source": "checks",
+      "fields": [
+        "range_checks"
+      ],
+      "signal": "customer_rating' within",
+      "minimum_violations": 1
+    },
+    {
+      "id": "extreme_total_outliers",
+      "source": "checks",
+      "fields": [
+        "range_checks"
+      ],
+      "signal": "grand_total' has no extreme high-value outliers",
+      "minimum_violations": 1
+    },
+    {
+      "id": "city_variants",
+      "source": "checks",
+      "fields": [
+        "duplicate_checks"
+      ],
+      "signal": "customer_city",
+      "minimum_violations": 1
+    },
+    {
+      "id": "country_variants",
+      "source": "checks",
+      "fields": [
+        "duplicate_checks"
+      ],
+      "signal": "customer_country",
+      "minimum_violations": 1
+    },
+    {
+      "id": "payment_method_variants",
+      "source": "checks",
+      "fields": [
+        "duplicate_checks"
+      ],
+      "signal": "payment_method",
+      "minimum_violations": 1
+    },
+    {
+      "id": "status_sentinels",
+      "source": "checks",
+      "fields": [
+        "format_checks"
+      ],
+      "signal": "delivery_status' contains sentinel-like",
+      "minimum_violations": 1
+    }
+  ],
+  "expected_transformation": {
+    "removed_exact_duplicate_rows": 350,
+    "trimmed_whitespace_cells_remaining": 0,
+    "all_output_records_match_allowlisted_policy": true,
+    "all_other_seeded_values_preserved": true,
+    "normalized_numeric_columns": [
+      "unit_price",
+      "quantity",
+      "discount_pct",
+      "line_subtotal",
+      "grand_total"
+    ],
+    "normalized_datetime_columns": [
+      "order_date",
+      "ship_date"
+    ],
+    "normalized_boolean_columns": [
+      "is_expedited_shipping"
+    ],
+    "case_only_category_columns": [
+      "customer_city",
+      "customer_country",
+      "product_category",
+      "payment_method",
+      "delivery_status"
+    ],
+    "contradictory_or_ambiguous_values_preserved": true
+  },
+  "approval_expectation": {
+    "integrity_passed": true,
+    "overall_passed": false,
+    "review_required": true,
+    "production_approved": false
+  },
+  "generator_anomaly_coverage": [
+    {
+      "category": "schema anomalies and mixed types",
+      "transformations": [
+        "normalize_numeric_format",
+        "normalize_boolean"
+      ]
+    },
+    {
+      "category": "currency strings and sentinel tokens",
+      "transformations": [
+        "normalize_numeric_format"
+      ]
+    },
+    {
+      "category": "mixed date formats and epoch timestamps",
+      "transformations": [
+        "normalize_datetime_format"
+      ]
+    },
+    {
+      "category": "temporal precedence inversions",
+      "findings": [
+        "order_before_ship_violations",
+        "delivery_before_ship_violations"
+      ]
+    },
+    {
+      "category": "arithmetic invariant breaches",
+      "findings": [
+        "line_subtotal_arithmetic_mismatch",
+        "grand_total_arithmetic_mismatch"
+      ]
+    },
+    {
+      "category": "fuzzy city and country variants",
+      "findings": [
+        "city_variants",
+        "country_variants"
+      ]
+    },
+    {
+      "category": "primary key collisions",
+      "findings": [
+        "transaction_id_collisions"
+      ]
+    },
+    {
+      "category": "injected exact duplicate rows",
+      "transformation": "removed_exact_duplicate_rows"
+    },
+    {
+      "category": "outliers and range violations",
+      "findings": [
+        "negative_prices",
+        "negative_or_malformed_quantities",
+        "discount_out_of_bounds",
+        "rating_out_of_bounds",
+        "extreme_total_outliers"
+      ]
+    },
+    {
+      "category": "heterogeneous boolean representations",
+      "transformations": [
+        "normalize_boolean"
+      ]
+    },
+    {
+      "category": "missing values injected by the generator",
+      "findings": [
+        "missing_values"
+      ]
+    },
+    {
+      "category": "inconsistent categorical representations",
+      "transformations": [
+        "normalize_category_case"
+      ]
+    }
+  ]
+}

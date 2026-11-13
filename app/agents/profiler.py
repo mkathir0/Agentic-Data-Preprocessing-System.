@@ -7,6 +7,7 @@ from langsmith import traceable
 
 from app.agents.schemas import ProfilerOutput
 from app.utils.data_loader import load_dataframe
+from app.agents.cleaning_policy import suggest_safe_format_actions
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,12 @@ def run_profiler(csv_path: str) -> ProfilerOutput:
                 clean_stats[k] = v
         columns_summary[col_name] = clean_stats
 
+    categorical_candidates = []
+    for col in df.columns:
+        if df[col].dtype == object and len(df) and 0 < df[col].nunique(dropna=True) / max(df[col].notna().sum(), 1) < 0.1:
+            categorical_candidates.append(col)
+    candidate_transformations = suggest_safe_format_actions(df, categorical_candidates)
+
     return ProfilerOutput(
         num_rows=num_rows,
         num_columns=num_columns,
@@ -57,5 +64,6 @@ def run_profiler(csv_path: str) -> ProfilerOutput:
         duplicate_rows=duplicate_rows,
         duplicate_rows_percentage=duplicate_percentage,
         column_types=column_types,
-        columns_summary=columns_summary
+        columns_summary=columns_summary,
+        candidate_transformations=candidate_transformations,
     )

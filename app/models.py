@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, DateTime, Float, Text, JSON
+from sqlalchemy import Column, String, DateTime, Float, Text, JSON, Integer
 from app.database import Base
 
 class Job(Base):
@@ -31,3 +31,16 @@ class Job(Base):
     plan_data = Column(JSON, nullable=True)          # TransformationPlan
     validation_report = Column(JSON, nullable=True)  # ValidationReport
     retry_count = Column(Float, default=0)           # Number of LLM retry attempts
+
+
+class JobTask(Base):
+    """Durable worker lease for a job; a stale running lease can be reclaimed."""
+    __tablename__ = "job_tasks"
+
+    job_id = Column(String, primary_key=True)
+    status = Column(String, nullable=False, default="QUEUED", index=True)
+    worker_id = Column(String, nullable=True, index=True)
+    lease_expires_at = Column(DateTime, nullable=True, index=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)

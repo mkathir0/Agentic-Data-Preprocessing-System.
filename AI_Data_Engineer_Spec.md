@@ -134,7 +134,7 @@ LangGraph is not responsible for cleaning data — its job is **orchestration**.
 Generates Python, SQL, dbt models, and transformation scripts. **No execution happens here** — generation only.
 
 ### 5.6 Execution Agent
-Runs the generated pipeline in a **Docker sandbox** or **Python subprocess**.
+Runs the generated pipeline in an OS-restricted runtime: macOS Seatbelt or Linux Docker with networking disabled, a read-only root filesystem, dropped capabilities, and resource limits. Execution fails closed when the sandbox runtime is unavailable.
 
 **Output:** new cleaned dataset
 
@@ -273,7 +273,7 @@ A sensible sequence to hand this to a coding agent, phase by phase:
 5. **LangGraph Orchestrator** — wire Observe → Plan → Execute → Validate loop with retry state
 6. **Transformation Planner (LLM)** — consumes only structured JSON from steps 2–4, outputs a transformation plan
 7. **Code Generation Agent** — plan → Python cleaning script (SQL/dbt deferred to V3)
-8. **Execution Agent** — Docker sandbox/subprocess runner, capture output dataset
+8. **Execution Agent** — OS-restricted runner (macOS Seatbelt/Linux Docker), capture candidate output dataset
 9. **Validation Agent** — re-run quality checks against output, pass/fail signal back to orchestrator
 10. **Escalation logic** — retry cap + confidence threshold → "Human Review Required" flag
 11. **Reporting** — Jinja/Markdown generation of `engineering_report.md` and `validation_report.md`

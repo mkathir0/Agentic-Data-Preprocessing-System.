@@ -25,15 +25,47 @@ This project is decoupled into clean, independently deployable backend and front
 
 ---
 
+## Data integrity policy
+
+Each upload and its artifacts are stored under a unique job ID. Source files are never cleaned in place. CSV/TSV loading preserves identifier strings, literal text such as `NA` and `NULL`, and blank records; ambiguous numeric representations remain text.
+
+Automatic transformations include whitespace trimming, whole-row exact deduplication, consistently parseable currency/numeric normalization, unambiguous date-format normalization, recognized boolean-token normalization, and case-only category normalization. The planner proposes format repairs from deterministic profiler evidence; the same policy is used by execution and integrity validation. Missing values are not imputed, fuzzy aliases are not merged, and arithmetic/temporal contradictions or outliers remain flagged for review unless an explicit domain rule is supplied.
+
+At execution time, every nontrivial planned repair is checked again against deterministic evidence computed from the original upload. A planner cannot force a repair by naming an allowed action: unsupported parameters, ambiguous date order, email/value correction, reused-key reconciliation, or any repair without a matching candidate is preserved and reported for review. This protects against a model proposing an action that the profiler did not establish as safe.
+
+Validation uses the original input schema and compares every output record and its multiplicity against the deterministic plan. Unplanned changes, missing columns, invented records, or unauthorized deletions fail integrity verification. Only a current run with both integrity and validation passing receives `COMPLETED`. Preserved candidates requiring review use `FAILED` with `current_step=REVIEW_FLAGGED` for compatibility with the existing API. Outputs that fail integrity are not available through the download endpoint.
+
+Unverified outputs, legacy job records, and the old benchmark artifacts were removed. Raw source uploads remain intact, including `raw_sample.csv` and `massive_messy_dataset.csv`. New outputs are created per job and are not production-approved unless the current integrity and validation gates pass.
+
+Generated scripts run with OS restrictions: macOS uses Seatbelt (`sandbox-exec`), and Linux uses a network-disabled, read-only-root Docker container with resource limits. Execution fails closed if the platform sandbox is unavailable. Each job starts from a fresh input copy and publishes output atomically after the sandbox exits.
+
+Uploads are committed to a database-backed queue before the API responds. Run the API and worker as separate processes from the same project directory, with the same `DATABASE_URL`, `UPLOAD_DIR`, and `OUTPUT_DIR`:
+
+```bash
+# Terminal 1: API
+uv run uvicorn app.main:app --reload --port 8000
+
+# Terminal 2: durable queue worker
+uv run python -m app.worker
+```
+
+Queue leases are renewed during processing and expire after worker loss, allowing another worker to reclaim interrupted jobs. Production replicas must share a durable database and the same upload/output filesystem. On Linux, build the executor image with `docker build -f Dockerfile.executor -t data-engineer-executor:latest .`; the worker needs access to the Docker daemon. On macOS, `sandbox-exec` is used directly.
+
+Run the regression suite with:
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
+
 ## 🚀 Key Features
 
 - **5-Stage LangGraph State Machine**: Cyclic feedback loop (`Profile` → `Plan` → `Code` → `Execute` → `Validate`) with state rollback and self-healing routing.
 - **Pandera Schema Contracts**: In-memory `DataFrameSchema(lazy=True)` validation scanning all columns in a single vectorized pass and collecting complete violation cases.
-- **Self-Healing Circuit Breaker**: Feeds Pandera failure cases, missing column exceptions, and boundary violations back to the LLM (up to 3 retries), recovering **83.3%** of initially broken runs without human intervention.
+- **Bounded Repair Loop**: Sends execution and validation findings back through planning and code generation for up to 3 retries. Unresolved or ambiguous findings are marked for human review; retry counts do not imply a successful repair.
 - **4-Dimensional Data Quality Scoring**: Objective 0–100 quality scoring across **Completeness**, **Validity**, **Uniqueness**, and **Consistency**.
-- **Data Integrity & Escalation Engine**: Multi-column exact deduplication, fuzzy near-duplicate clustering (Levenshtein token set ratio $\ge 85\%$), and Primary Key collision isolation.
+- **Data Integrity & Escalation Engine**: Exact duplicate detection, fuzzy near-duplicate *candidates* for review, and primary key collision detection. Fuzzy matches are never merged automatically.
 - **Great Expectations (GX) Interoperability**: Automatic translation of validated Pandera contracts into standard Great Expectations JSON expectation suites for CI/CD and dbt pipelines.
-- **Production-Grade Security**: Secured with API-Key authentication (`X-API-Key`), configurable CORS origins, and HTTP security headers (`X-Content-Type-Options`, `X-Frame-Options`, `X-XSS-Protection`).
+- **API Protections**: API-Key authentication (`X-API-Key`), configurable CORS origins, HTTP security headers, and OS-restricted generated-code execution.
 
 ---
 
@@ -48,7 +80,7 @@ graph TD
     E --> F[Node 5: Validate]
     
     F -->|Pandera / Invariant Errors?| G{Circuit Breaker}
-    G -->|"Yes (Retries &lt; 3)"| D
+    G -->|"Yes (Retries &lt; 3)"| C
     G -->|"Passed or Max Retries"| H[Node 6: Report]
     H --> I([Job Complete & Download Ready])
     
@@ -65,25 +97,17 @@ graph TD
 1. **Profile**: Fast deterministic profiling (inferred types, null ratios, cardinality, value ranges, potential primary keys).
 2. **Plan**: LLM formulates a structured `TransformationPlan` with explicit column-level actions and domain assumptions.
 3. **Code**: LLM writes idiomatic pandas cleaning code, receiving error stack traces on self-healing retries.
-4. **Execute**: Runs the cleaning code against the dataset inside an isolated Python execution environment.
-5. **Validate**: Pandera lazy schema verification, 4D scoring, cross-field invariants, fuzzy deduplication, and key-conflict detection.
-6. **Report**: Compiles audit logs, statistical distribution diffs, and exports a Great Expectations JSON suite.
+4. **Execute**: Runs the cleaning code in the platform OS sandbox against a fresh input copy, then publishes the verified candidate atomically.
+5. **Validate**: Pandera schema verification, 4D scoring, cross-field checks, fuzzy candidate detection, key-conflict detection, and record-level integrity comparison.
+6. **Report**: Writes an engineering Markdown report, a machine-readable validation JSON report, and a Great Expectations JSON suite when a contract is available. The cleaning script is stored separately; a cleaned CSV is only downloadable after record integrity passes.
 
 ---
 
 ## 📊 Benchmark Results
 
-Evaluated across **6 diverse real-world domain datasets (~50,000 rows)**:
+Earlier benchmark scores are withdrawn. They were produced by hand-written transformations that bypassed the current safety policy and are not evidence of production-ready output. `benchmark.py` now evaluates only the allowlisted cleaning policy, runs integrity and validation checks, and keeps benchmark candidates temporary. It does not claim LLM recovery or production approval.
 
-| Dataset | Rows Before | Rows Cleaned | Raw DQ Score | Cleaned DQ Score | Improvement | Retries | Pandera Status |
-|---|---|---|---|---|---|---|---|
-| E-Commerce Orders | 10,000 | 9,880 | 79.4 / 100 | **98.2 / 100** | +18.8% | 1 (Healed) | PASSED |
-| Healthcare Patients | 8,500 | 8,420 | 81.2 / 100 | **99.1 / 100** | +17.9% | 0 | PASSED |
-| Financial Transactions | 12,000 | 11,850 | 84.0 / 100 | **98.5 / 100** | +14.5% | 1 (Healed) | PASSED |
-| IoT Sensor Telemetry | 9,000 | 8,910 | 85.1 / 100 | **97.8 / 100** | +12.7% | 0 | PASSED |
-| SaaS User Churn | 6,500 | 6,430 | 80.5 / 100 | **98.0 / 100** | +17.5% | 0 | PASSED |
-| Logistics Deliveries | 7,500 | 7,410 | 82.8 / 100 | **98.9 / 100** | +16.1% | 0 | PASSED |
-| **Averages / Totals** | **53,500** | **52,900** | **82.6 / 100** | **98.4 / 100** | **+15.8%** | **83.3% Circuit Breaker Recovery** | **100% Passed** |
+The `massive_messy_dataset.csv` acceptance contract is recorded in [`tests/fixtures/massive_messy_dataset_expectations.json`](tests/fixtures/massive_messy_dataset_expectations.json). Its integration test asserts the exact 350-row duplicate removal, safe format repairs, record-level integrity, detection of unresolved injected defects, and the expected human-review outcome. The fixture is test input, not a source of rules for arbitrary datasets.
 
 ---
 
@@ -116,7 +140,7 @@ uv run uvicorn app.main:app --reload --port 8000
 
 ### 4. Run Unit Verification Tests
 ```bash
-uv run python verify_validation_engine.py
+uv run python -m unittest discover -s tests -v
 ```
 
 ### 5. Run Benchmark Suite

@@ -20,11 +20,19 @@ An **autonomous, enterprise-grade AI Data Preprocessing & Validation System** ca
 3. **Autonomous Safety Protocol (Human-in-the-Loop):**  
    If primary key collisions (identical IDs with conflicting attributes) or domain contradictions are detected, the system safely preserves the data and flags the rows for human review rather than blindly overwriting or deleting business transactions.
 4. **Production Handoff Interoperability:**  
-   Every run produces 4 distinct deliverables:
+   A validated run produces these core deliverables:
    - The **Cleaned CSV** (`cleaned_{filename}.csv`)
    - The **Production Python Cleaning Script** (`clean_{filename}.py`) for zero-token ETL runs
    - The **Great Expectations Validation Suite** (`quality_suite_{filename}.json`) for automated CI/CD gating
    - The **Executive Engineering Markdown Audit** (`report_{filename}.md`) with statistical before/after diffs
+   The backend also writes a machine-readable validation report (`validation_{filename}.json`). Review candidates retain validation evidence but are not marked production-approved.
+
+### Current Backend Contract
+- Automatic edits use deterministic candidates for numeric/currency parsing, unambiguous date normalization, recognized booleans, case-only categorical variants, whitespace, and exact whole-row duplicates. Imputation, fuzzy category merging, outlier correction, and contradictory business-rule reconciliation preserve source values and require review.
+- Validation compares all output records and multiplicities against that deterministic policy. A file is production-approved only when integrity and validation pass with no review requirement.
+- Validation failures return through planning and code generation for at most three repair attempts. Fuzzy matches are candidates for human review, never automatic merges.
+- Generated scripts run with OS restrictions: macOS Seatbelt or a Linux Docker container with no network, read-only root filesystem, dropped capabilities, and resource limits. Execution fails closed when the required runtime is missing.
+- Uploads create durable queue records before the API responds. A separate `python -m app.worker` process claims work with renewable leases; expired leases are reclaimable after a worker crash. Production workers must share the database and upload/output filesystem.
 
 ---
 
@@ -43,7 +51,7 @@ An **autonomous, enterprise-grade AI Data Preprocessing & Validation System** ca
 [ Node 3: CodeGenAgent ]  ──► Generates self-contained, vectorized Python pandas script
         │
         ▼
-[ Node 4: ExecutorAgent ] ──► Runs script in isolated subprocess on real data; generates output CSV
+[ Node 4: ExecutorAgent ] ──► Runs script in OS-restricted workspace; atomically publishes candidate CSV
         │
         ▼
 [ Node 5: ValidationEngine ]
@@ -58,7 +66,7 @@ An **autonomous, enterprise-grade AI Data Preprocessing & Validation System** ca
    │                                  │
    ▼                                  ▼
 [Circuit Breaker Feedback]       [ Node 6: ReporterAgent ]
-(Route back to Node 3)                │
+(Route back to Planner)               │
                                       ├── Generates Markdown Report (.md)
                                       ├── Exports Great Expectations Suite (.json)
                                       └── Updates Job Status (COMPLETED / REVIEW_FLAGGED)
@@ -66,7 +74,9 @@ An **autonomous, enterprise-grade AI Data Preprocessing & Validation System** ca
 
 ---
 
-## 3. Complete Chronological Evolution & Issues Resolved
+## 3. Historical Change Log (Superseded Where Noted)
+
+The issue notes below describe earlier behavior. The current backend contract in Section 1 takes precedence; historical claims about successful cleaning, production status, fuzzy deduplication, and benchmark results are not evidence that old output files are safe.
 
 ### Issue 1: Groq Token Limit Exceeded (HTTP 413)
 * **Symptom:** `Request too large for model 'qwen/qwen3.8-27b' on input tokens per minute (ITPM): Limit 7000, Requested 10530`.
@@ -152,7 +162,7 @@ When a dataset finishes processing, users now have a **"Production Handoff & Rec
   - [app/agents/graph.py](file:///Users/mithrajitkathir/Documents/agentic-ai-preprocessing/app/agents/graph.py): 5-stage state graph and LangSmith `@traceable` hooks.
   - [app/agents/validation_engine.py](file:///Users/mithrajitkathir/Documents/agentic-ai-preprocessing/app/agents/validation_engine.py): Pandera contracts, GX suite generation, and 4D quality scoring.
   - [app/routers/jobs.py](file:///Users/mithrajitkathir/Documents/agentic-ai-preprocessing/app/routers/jobs.py): Job processing, report serving, and LangSmith SDK run querying.
-  - [outputs/](file:///Users/mithrajitkathir/Documents/agentic-ai-preprocessing/outputs/): Generated cleaned CSVs, Python scripts, and markdown reports.
+  - `OUTPUT_DIR/<job_id>/`: Per-job cleaned or review-candidate CSV, script, engineering report, validation JSON, and optional Great Expectations suite. Historical generated artifacts were removed.
 
 ### Frontend (`Agentic-Data-Preprocessing-System-Frontend`)
 - **Language / Framework:** Next.js 16 (App Router), React 19, TypeScript, Tailwind CSS, Framer Motion, Lucide Icons.
@@ -164,15 +174,9 @@ When a dataset finishes processing, users now have a **"Production Handoff & Rec
 
 ---
 
-## 6. Verification & Validation Status
+## 6. Current Verification Status
 
-1. **Backend Tests:** Verified live via Python virtual environment:
-   - `pandera_schema_passed`: Lazy contract validation executed.
-   - `key_conflict_count`: Accurately identified 240 primary key conflicts.
-   - `great_expectations_suite`: 26 assertions generated.
-   - `GET /api/jobs/{id}/langsmith-traces`: Successfully queried and returned live cloud traces.
-2. **Frontend Build:** Verified clean `npm run build` with zero TypeScript or bundling errors.
-3. **Git Commits & Remotes:** Both repositories committed and pushed to `main` branch with author email `170449729+mkathir0@users.noreply.github.com`.
-4. **Active Services:**
-   - FastAPI running at `http://localhost:8000`
-   - Next.js Turbopack dev server running at `http://localhost:3000`
+- The backend regression suite covers upload-to-worker processing, deterministic transformations, integrity validation, review-only outputs, durable queue claims/recovery, report artifacts, and OS sandbox restrictions.
+- Run it with `uv run python -m unittest discover -s tests -v`.
+- Historical database jobs and generated outputs from the older policy were cleared. The raw uploaded test CSVs remain unchanged.
+- No live API, worker, or frontend service is assumed to be running.

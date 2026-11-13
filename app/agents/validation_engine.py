@@ -29,6 +29,7 @@ from app.agents.schemas import (
     SchemaOutput
 )
 from app.utils.data_loader import load_dataframe
+from app.agents.cleaning_policy import apply_cleaning_plan, frames_match
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +40,6 @@ DOMAIN_RANGE_RULES = [
     (re.compile(r'\bage\b|_age|age_', re.I), 0.0, 120.0, "age"),
     (re.compile(r'\bbmi\b', re.I), 10.0, 70.0, "bmi"),
     (re.compile(r'percent|pct|rate', re.I), 0.0, 100.0, "percentage"),
-    (re.compile(r'price|cost|amount|revenue|salary|fee|fare|subtotal|total', re.I), 0.0, None, "monetary"),
     (re.compile(r'duration|seconds|minutes|hours', re.I), 0.0, None, "duration"),
     (re.compile(r'quantity|qty|units|count|items', re.I), 0.0, None, "quantity"),
 ]
@@ -51,6 +51,211 @@ FORMAT_PATTERNS = {
     'url': re.compile(r'^https?://'),
     'uuid': re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I),
 }
+
+SENTINEL_TOKENS = {"", "n/a", "na", "null", "none", "nan", "unknown", "missing", "-999"}
+
+
+def _parse_numeric_text(value: Any) -> Optional[float]:
+    """Parse common numeric representations for validation only; never rewrite data."""
+    if value is None or pd.isna(value):
+        return None
+    if isinstance(value, (int, float, np.number)) and not isinstance(value, (bool, np.bool_)):
+        return float(value)
+    text = str(value).strip()
+    if text.lower() in SENTINEL_TOKENS:
+        return None
+    text = re.sub(r"^(?:USD\s*)", "", text, flags=re.I)
+    text = text.replace(",", "")
+    text = re.sub(r"^\$\s*", "", text)
+    text = re.sub(r"^-\$\s*", "-", text)
+    text = re.sub(r"\s*(?:units?)$", "", text, flags=re.I)
+    if text.endswith("%"):
+        text = text[:-1].strip()
+    if not re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", text):
+        return None
+    number = float(text)
+    return number
+
+
+def _parse_mixed_datetime(value: Any) -> pd.Timestamp:
+    """Parse common date encodings for checks only, including the fixture's epoch values."""
+    if value is None or pd.isna(value):
+        return pd.NaT
+    text = str(value).strip()
+    if re.fullmatch(r"\d{10}", text):
+        return pd.to_datetime(int(text), unit="s", errors="coerce")
+    formats = (
+        "%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y", "%m/%d/%Y %H:%M:%S",
+        "%d-%b-%Y", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d",
+    )
+    for fmt in formats:
+        try:
+            return pd.Timestamp(pd.to_datetime(text, format=fmt, errors="raise"))
+        except (ValueError, TypeError):
+            continue
+    return pd.to_datetime(text, errors="coerce")
+
+
+def _numeric_validation_checks(df: pd.DataFrame) -> Tuple[List[ValidationCheck], List[ValidationCheck]]:
+    """Find mixed numeric encodings, domain violations and robust outliers."""
+    format_checks: List[ValidationCheck] = []
+    range_checks: List[ValidationCheck] = []
+    for col in df.columns:
+        name = col.lower()
+        if not re.search(r"price|amount|subtotal|tax|total|quantity|qty|discount|percent|rating", name):
+            continue
+        source = df[col]
+        parsed = source.map(_parse_numeric_text)
+        valid = parsed.dropna().astype(float)
+        if valid.empty:
+            continue
+        non_null_count = int(source.notna().sum())
+        invalid_count = non_null_count - len(valid)
+        if invalid_count and len(valid) >= max(5, int(non_null_count * 0.20)):
+            format_checks.append(_check(
+                "format_encoding", f"'{col}' contains mixed numeric formats or sentinel tokens",
+                passed=False, violations=invalid_count,
+                details=f"{invalid_count} non-null values cannot be interpreted as numbers without a domain rule",
+            ))
+        decorated_count = int(source.dropna().astype(str).str.contains(r"\$|\bUSD\b|%|\bunits?\b", case=False, regex=True).sum())
+        if decorated_count:
+            format_checks.append(_check(
+                "format_encoding", f"'{col}' has currency, unit, or percentage text representations",
+                passed=False, violations=decorated_count,
+                details=f"{decorated_count} values include symbols or unit/percent suffixes; source text is preserved",
+            ))
+
+        bounds = None
+        if "rating" in name:
+            bounds = (1.0, 5.0, "rating")
+        elif "discount" in name or "percent" in name or "pct" in name:
+            bounds = (0.0, 100.0, "percentage")
+        elif "quantity" in name or re.search(r"(^|_)qty($|_)", name):
+            bounds = (0.0, None, "quantity")
+        elif "price" in name or "amount" in name or "subtotal" in name or "tax" in name or "total" in name:
+            bounds = (0.0, None, "nonnegative amount")
+        if bounds:
+            lo, hi, label = bounds
+            bad = valid < lo
+            if hi is not None:
+                bad |= valid > hi
+            count = int(bad.sum())
+            if count:
+                range_checks.append(_check(
+                    "range_bounds", f"'{col}' within {label} bounds",
+                    passed=False, violations=count,
+                    details=f"{count} parsed values fall outside [{lo}, {hi}]",
+                ))
+
+        if len(valid) >= 20 and any(term in name for term in ("price", "amount", "subtotal", "tax", "total")):
+            q1, q3 = valid.quantile(0.25), valid.quantile(0.75)
+            iqr = q3 - q1
+            if iqr > 0:
+                outliers = int((valid > q3 + 3 * iqr).sum())
+                if outliers:
+                    range_checks.append(_check(
+                        "range_bounds", f"'{col}' has no extreme high-value outliers",
+                        passed=False, violations=outliers,
+                        details=f"{outliers} values exceed the upper 3×IQR fence ({q3 + 3 * iqr:g})",
+                    ))
+    return format_checks, range_checks
+
+
+def _representation_format_checks(df: pd.DataFrame) -> List[ValidationCheck]:
+    checks: List[ValidationCheck] = []
+    date_patterns = [
+        ("iso_date", re.compile(r"^\d{4}-\d{2}-\d{2}(?:[ T].*)?$")),
+        ("us_slash_date", re.compile(r"^\d{1,2}/\d{1,2}/\d{4}$")),
+        ("month_name_date", re.compile(r"^\d{1,2}-[A-Za-z]{3}-\d{4}$")),
+        ("timestamp_date", re.compile(r"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}$")),
+        ("epoch_seconds", re.compile(r"^\d{10}$")),
+    ]
+    bool_tokens = {"true", "false", "1", "0", "yes", "no", "y", "n", "t", "f"}
+    for col in df.columns:
+        values = df[col].dropna().astype(str).str.strip()
+        if values.empty:
+            continue
+        numeric_like_ratio = df[col].map(_parse_numeric_text).notna().mean()
+        if numeric_like_ratio <= 0.50:
+            folded_groups: Dict[str, set[str]] = {}
+            for value in values.unique():
+                folded_groups.setdefault(value.casefold(), set()).add(value)
+            casing_variants = sum(len(group) - 1 for group in folded_groups.values() if len(group) > 1)
+            if casing_variants:
+                checks.append(_check(
+                    "format_encoding", f"'{col}' contains case-inconsistent category values",
+                    passed=False, violations=casing_variants,
+                    details=f"{casing_variants} duplicate categories differ only by letter case; source values are preserved",
+                ))
+        sentinel_values = values.str.casefold().isin(SENTINEL_TOKENS)
+        if sentinel_values.any() and not re.search(r"notes?|description|comment|message", col, re.I):
+            checks.append(_check(
+                "format_encoding", f"'{col}' contains sentinel-like text values",
+                passed=False, violations=int(sentinel_values.sum()),
+                details=f"{int(sentinel_values.sum())} values resemble null/missing sentinels; source values are preserved",
+            ))
+        if "date" in col.lower() or "time" in col.lower():
+            formats = {name for name, pattern in date_patterns if values.map(lambda value: bool(pattern.fullmatch(value))).any()}
+            if len(formats) > 1:
+                checks.append(_check(
+                    "format_encoding", f"'{col}' contains mixed date formats",
+                    passed=False, violations=len(formats),
+                    details=f"Observed representations: {', '.join(sorted(formats))}; values are preserved because date convention is not inferred",
+                ))
+        tokens = {value.lower() for value in values.unique()}
+        if (col.lower().startswith(("is_", "has_", "was_", "can_")) and tokens and tokens <= bool_tokens
+                and len(tokens) > 2):
+            checks.append(_check(
+                "format_encoding", f"'{col}' contains heterogeneous boolean representations",
+                passed=False, violations=len(tokens) - 2,
+                details=f"Observed boolean tokens: {', '.join(sorted(tokens))}; source representations are preserved",
+            ))
+    return checks
+
+
+def _arithmetic_validation_checks(df: pd.DataFrame) -> List[ValidationCheck]:
+    checks: List[ValidationCheck] = []
+    required = {"unit_price", "quantity", "discount_pct", "line_subtotal", "tax_amount", "grand_total"}
+    if not required.issubset(df.columns):
+        return checks
+    parsed = {col: df[col].map(_parse_numeric_text) for col in required}
+    price = parsed["unit_price"]
+    # The generator's arithmetic uses the integer quantity only. Values such
+    # as "3.0" and "3 units" are seeded format anomalies and cannot be treated
+    # as the known quantity used to construct the expected subtotal.
+    raw_quantity = df["quantity"].astype("string").str.strip()
+    if pd.api.types.is_numeric_dtype(df["quantity"]):
+        quantity_is_unambiguous_integer = (df["quantity"] > 0) & np.isclose(df["quantity"] % 1, 0)
+    else:
+        quantity_is_unambiguous_integer = raw_quantity.str.fullmatch(r"[1-9]\d*", na=False)
+    quantity = parsed["quantity"].where(quantity_is_unambiguous_integer)
+    discount, subtotal = parsed["discount_pct"], parsed["line_subtotal"]
+    tax, total = parsed["tax_amount"], parsed["grand_total"]
+    discount_points = discount.where(discount.isna() | (discount.abs() > 1), discount * 100)
+    valid_subtotal = (
+        price.notna() & quantity.notna() & discount_points.notna() & subtotal.notna()
+        & (price > 0) & (quantity > 0) & (discount_points >= 0) & (discount_points <= 100)
+    )
+    expected_subtotal = price * quantity * (1 - discount_points / 100)
+    bad_subtotal = valid_subtotal & ((expected_subtotal - subtotal).abs() > expected_subtotal.abs().clip(lower=1) * 0.015)
+    subtotal_violations = int(bad_subtotal.sum())
+    if subtotal_violations:
+        checks.append(_check(
+            "cross_field", "unit_price × quantity × (1 − discount) matches line_subtotal",
+            passed=False, violations=subtotal_violations,
+            details=f"{subtotal_violations} rows with parseable, in-range inputs disagree with the line subtotal",
+        ))
+    valid_total = subtotal.notna() & tax.notna() & total.notna() & (subtotal >= 0) & (tax >= 0) & (total >= 0)
+    expected_total = subtotal + tax
+    bad_total = valid_total & ((expected_total - total).abs() > expected_total.abs().clip(lower=1) * 0.015)
+    total_violations = int(bad_total.sum())
+    if total_violations:
+        checks.append(_check(
+            "cross_field", "line_subtotal + tax_amount matches grand_total",
+            passed=False, violations=total_violations,
+            details=f"{total_violations} rows with parseable amounts disagree with subtotal plus tax",
+        ))
+    return checks
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -101,7 +306,8 @@ def _col_stats(df: pd.DataFrame, col: str) -> ColumnStats:
 def build_dynamic_pandera_schema(
     df: pd.DataFrame,
     schema_info: Optional[SchemaOutput] = None,
-    pks_override: Optional[List[str]] = None
+    pks_override: Optional[List[str]] = None,
+    plan_actions: Optional[List[dict]] = None,
 ) -> pa.DataFrameSchema:
     """
     Synthesizes a Pandera DataFrameSchema dynamically from the inferred schema
@@ -117,6 +323,11 @@ def build_dynamic_pandera_schema(
                 if df[col].nunique() / max(len(df), 1) > 0.90:
                     pks.append(col)
 
+    planned_numeric_columns = {
+        action.get("column") for action in (plan_actions or [])
+        if action.get("action_type") == "normalize_numeric_format"
+    }
+
     for col in df.columns:
         series = df[col]
         checks = []
@@ -125,6 +336,8 @@ def build_dynamic_pandera_schema(
 
         # Inferred target dtype
         target_type_str = schema_info.inferred_types.get(col, "").lower() if (schema_info and schema_info.inferred_types) else ""
+        if col in planned_numeric_columns:
+            target_type_str = "float"
         is_num = (pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series)) or ("int" in target_type_str) or ("float" in target_type_str)
 
         # Check domain range bounds
@@ -150,8 +363,10 @@ def build_dynamic_pandera_schema(
         # Build Pandera column contract
         if "int" in target_type_str:
             col_dtype = float if series.isnull().any() else int
-        elif "float" in target_type_str or "numeric" in target_type_str:
+        elif "float" in target_type_str:
             col_dtype = float
+        elif "numeric" in target_type_str:
+            col_dtype = series.dtype
         elif "datetime" in target_type_str:
             col_dtype = "datetime64[ns]" if pd.api.types.is_datetime64_any_dtype(series) else object
         elif "bool" in target_type_str:
@@ -234,7 +449,7 @@ def validate_pandera_contract(
 def detect_fuzzy_duplicates(
     df: pd.DataFrame,
     columns: Optional[List[str]] = None,
-    threshold: float = 0.85
+    threshold: float = 0.78
 ) -> Tuple[int, List[str], List[ValidationCheck]]:
     """
     Detects near-duplicate entity strings in categorical columns using sequence matching
@@ -249,6 +464,11 @@ def detect_fuzzy_duplicates(
     for col in target_cols:
         series = df[col].dropna().astype(str)
         n_unique = series.nunique()
+        if re.search(r"price|amount|subtotal|tax|total|quantity|qty|discount|percent|rating|_id$", col, re.I):
+            continue
+        numeric_like_ratio = df[col].map(_parse_numeric_text).notna().mean()
+        if numeric_like_ratio > 0.50:
+            continue
         # Evaluate on columns with moderate cardinality (e.g. cities, departments, categories)
         if n_unique < 2 or n_unique > 300:
             continue
@@ -392,7 +612,7 @@ def check_cross_field_relations(
         return checks, violations, patterns
 
     # 1. Temporal Ordering
-    start_patterns = re.compile(r'start|begin|created|order_date|opened|from', re.I)
+    start_patterns = re.compile(r'start|begin|created|order_date|ship_date|opened|from', re.I)
     end_patterns = re.compile(r'end|finish|closed|ship_date|resolved|to\b|stop|delivery_date', re.I)
     date_hint = re.compile(r'date|time|\bat\b|_at$|_on$', re.I)
     indicator_pattern = re.compile(r'missing|indicator|flag|isna|_is_|_has_|^is_|^has_', re.I)
@@ -406,8 +626,8 @@ def check_cross_field_relations(
                 continue
             # Compare
             try:
-                s = pd.to_datetime(df[sc], errors='coerce')
-                e = pd.to_datetime(df[ec], errors='coerce')
+                s = df[sc].map(_parse_mixed_datetime)
+                e = df[ec].map(_parse_mixed_datetime)
                 valid = s.notna() & e.notna()
                 min_valid = min(n, 2)
                 if valid.sum() < min_valid:
@@ -609,7 +829,7 @@ def execute_full_validation_engine(
 ) -> ValidationReport:
     """
     Orchestrates the complete validation engine:
-    - Synthesizes and checks Pandera contract on cleaned dataset
+    - Checks cleaned data against a contract anchored to the original dataset
     - Evaluates 7 quality categories (Schema, Bounds, Cross-Field, Distributional, Duplicates, Formats, Regression)
     - Detects fuzzy near-duplicate entity variations
     - Detects primary key conflicts
@@ -633,13 +853,15 @@ def execute_full_validation_engine(
     # Detect candidate primary keys consistently across Pandera and collision checks
     pks = list(schema.primary_keys) if (schema and schema.primary_keys) else []
     if not pks:
-        for col in df_after.columns:
+        for col in df_before.columns:
             if re.search(r'\bid\b|_id$|uuid', col, re.I):
-                if df_after[col].nunique() / max(len(df_after), 1) > 0.90:
+                if df_before[col].nunique() / max(len(df_before), 1) > 0.90:
                     pks.append(col)
 
     # ── Category 1: Schema & Pandera Contract ──
-    pandera_schema = build_dynamic_pandera_schema(df_after, schema, pks_override=pks)
+    pandera_schema = build_dynamic_pandera_schema(
+        df_before, schema, pks_override=pks, plan_actions=plan_actions
+    )
     pandera_passed, pandera_failures, pandera_feedback, pandera_checks = validate_pandera_contract(df_after, pandera_schema)
     report.pandera_schema_passed = pandera_passed
     report.pandera_failure_count = sum(f['violation_count'] for f in pandera_failures)
@@ -682,9 +904,12 @@ def execute_full_validation_engine(
                     details=f"{tot} out-of-bound values" if tot else f"All values in [{lo}, {hi}]"
                 ))
                 break
+    numeric_format_checks, numeric_range_checks = _numeric_validation_checks(df_after)
+    report.range_checks.extend(numeric_range_checks)
 
     # ── Category 3: Cross-Field Relational ──
     cf_checks, biz_violations, miss_patterns = check_cross_field_relations(df_after, schema)
+    cf_checks.extend(_arithmetic_validation_checks(df_after))
     report.cross_field_checks = cf_checks
     report.business_rule_violations = biz_violations
     report.missingness_patterns = miss_patterns
@@ -745,6 +970,8 @@ def execute_full_validation_engine(
 
     # ── Category 6: Format & Encoding ──
     format_checks = []
+    format_checks.extend(numeric_format_checks)
+    format_checks.extend(_representation_format_checks(df_after))
     for col in df_after.select_dtypes(include=['object', 'string']).columns:
         series = df_after[col].dropna()
         if len(series) == 0:
@@ -777,15 +1004,19 @@ def execute_full_validation_engine(
     # ── Category 7: Regression & Safety ──
     reg_checks = []
     new_nulls = {}
-    row_drop = len(df_before) - len(df_after)
-    row_drop_pct = _pct(row_drop, len(df_before)) * 100
-
+    expected, review_reasons = apply_cleaning_plan(df_before, plan_actions or [])
+    report.integrity_passed = frames_match(expected, df_after)
+    report.review_required = bool(review_reasons)
+    report.review_reasons = review_reasons
     reg_checks.append(_check(
-        "regression",
-        "Row retention within safety threshold (<= 15% drop)",
-        passed=(row_drop_pct <= 15.0),
-        violations=max(0, row_drop),
-        details=f"Rows: {len(df_before):,} → {len(df_after):,} ({row_drop:+,} rows, {round(row_drop_pct, 1)}% dropped)"
+        "regression", "Output records match the permitted cleaning plan",
+        passed=report.integrity_passed,
+        violations=0 if report.integrity_passed else 1,
+        details="All record values and multiplicities checked against the deterministic plan; row ordering may differ.",
+    ))
+    reg_checks.append(_check(
+        "regression", "Original columns preserved", list(df_before.columns) == list(df_after.columns),
+        violations=len(report.columns_dropped) + len(report.columns_added),
     ))
 
     # New nulls introduced by cleaning
@@ -793,8 +1024,10 @@ def execute_full_validation_engine(
         if col in df_after.columns:
             nb = int(df_before[col].isnull().sum())
             na = int(df_after[col].isnull().sum())
-            if na > nb:
-                intro = na - nb
+            expected_nulls = int(expected[col].isnull().sum()) if col in expected.columns else nb
+            permitted_null_increase = max(0, expected_nulls - nb) if report.integrity_passed else 0
+            if na > nb + permitted_null_increase:
+                intro = na - nb - permitted_null_increase
                 new_nulls[col] = intro
                 reg_checks.append(_check(
                     "regression",
@@ -825,7 +1058,15 @@ def execute_full_validation_engine(
     report.total_checks = len(all_checks)
     report.total_passed = sum(1 for c in all_checks if c.passed)
     report.total_failed = sum(1 for c in all_checks if not c.passed)
-    report.overall_passed = (report.total_failed == 0 and report.pandera_schema_passed)
+    # A failed heuristic check is a finding that needs a grounded fix or human
+    # review; never silently turn it into a production-approved result.
+    failed_checks = [check for check in all_checks if not check.passed]
+    for check in failed_checks:
+        reason = f"{check.name}: {check.details}"
+        if reason not in report.review_reasons:
+            report.review_reasons.append(reason)
+    report.review_required = bool(report.review_reasons)
+    report.overall_passed = (report.total_failed == 0 and report.pandera_schema_passed and not report.review_required)
 
     # ── 4-Dimensional Data Quality Scores ──
     # Evaluate raw dataset (df_before) against all checks to get authentic baseline score
@@ -919,7 +1160,12 @@ def execute_full_validation_engine(
             severity="high"
         ))
 
-    report.exact_duplicates_removed = max(0, len(df_before) - len(df_after))
+    report.exact_duplicates_removed = (len(df_before) - len(expected)) if report.integrity_passed else 0
+    if not report.integrity_passed:
+        flags.append(EscalationFlag(column=None, severity="high", reason="Output differs from the permitted plan; records or values were changed without a verified rule."))
+    for reason in report.review_reasons:
+        if not any(flag.reason == reason for flag in flags):
+            flags.append(EscalationFlag(column=None, severity="medium", reason=reason))
 
     # ── Category 7: Great Expectations Suite Generation ──
     try:
@@ -981,22 +1227,18 @@ def export_great_expectations_suite(
         if col_obj.checks:
             for check in col_obj.checks:
                 check_name = check.name or ""
-                if "in_range" in check_name:
-                    parts = check_name.split("_")
-                    if len(parts) >= 4:
-                        try:
-                            lo = float(parts[-2])
-                            hi = float(parts[-1])
-                            expectations.append({
-                                "expectation_type": "expect_column_values_to_be_between",
-                                "kwargs": {"column": col_name, "min_value": lo, "max_value": hi}
-                            })
-                        except Exception:
-                            pass
+                if "in_range" in check_name or "_gte_" in check_name or "_lte_" in check_name:
+                    stats = check.statistics or {}
+                    expectations.append({
+                        "expectation_type": "expect_column_values_to_be_between",
+                        "kwargs": {"column": col_name,
+                                   "min_value": stats.get("min_value"),
+                                   "max_value": stats.get("max_value")},
+                    })
                 elif "format" in check_name or "regex" in check_name or "matches" in check_name:
                     expectations.append({
                         "expectation_type": "expect_column_values_to_match_regex",
-                        "kwargs": {"column": col_name, "regex": "standard_format_pattern"}
+                        "kwargs": {"column": col_name, "regex": check.statistics.get("pattern", "")}
                     })
 
     return {

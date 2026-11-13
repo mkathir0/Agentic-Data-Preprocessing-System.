@@ -1,5 +1,6 @@
 import os
 import json
+from pathlib import Path
 from typing import Optional, Dict, Any, Union
 from langsmith import traceable
 from app.agents.schemas import ValidationReport
@@ -43,12 +44,16 @@ def generate_report(
     improvement = vr.score_improvement if vr else 0.0
     rows_before = vr.rows_before if vr else "N/A"
     rows_after = vr.rows_after if vr else "N/A"
-    pandera_status = "PASSED" if (vr and vr.pandera_schema_passed) else "FAILED / VIOLATIONS"
+    row_delta = rows_after - rows_before if vr else "N/A"
+    pandera_status = "PASSED" if (vr and vr.pandera_schema_passed) else ("FAILED / VIOLATIONS" if vr else "NOT RUN")
+    production_approved = bool(vr and vr.overall_passed and vr.integrity_passed and not vr.review_required)
 
     lines = [
         f"# AI Data Engineering & Quality Report",
         f"**Job ID:** `{job_id}`  ",
         f"**Pipeline Status:** {quality_summary}  ",
+        f"**Integrity verification:** {'PASSED' if vr and vr.integrity_passed else 'NOT PASSED'}  ",
+        f"**Production approval:** {'APPROVED — all recorded checks passed' if production_approved else 'NOT APPROVED — validation failed, evidence is missing, or human review is required'}  ",
         "",
         "---",
         "",
@@ -56,20 +61,25 @@ def generate_report(
         "",
         "| Metric | Raw (Before) | Cleaned (After) | Change / Delta |",
         "| :--- | :---: | :---: | :---: |",
-        f"| **Overall Data Quality Score** | **{score_before:.1f} / 100** | **{score_after:.1f} / 100** | **+{improvement:.1f}%** |",
-        f"| **Completeness (Nulls)** | — | {vr.completeness_score if vr else 0.0:.1f} / 100 | Verified |",
-        f"| **Validity (Types & Ranges)** | — | {vr.validity_score if vr else 0.0:.1f} / 100 | Verified |",
-        f"| **Uniqueness (Duplicates & Keys)** | — | {vr.uniqueness_score if vr else 0.0:.1f} / 100 | Verified |",
-        f"| **Consistency (Cross-field Rules)** | — | {vr.consistency_score if vr else 0.0:.1f} / 100 | Verified |",
-        f"| **Total Rows** | {rows_before} | {rows_after} | Retained |",
-        f"| **Pandera Contract Conformance** | Untested | **{pandera_status}** | Enforced |",
+        f"| **Overall Data Quality Score** | **{score_before:.1f} / 100** | **{score_after:.1f} / 100** | **{improvement:+.1f} points** |",
+        f"| **Completeness (Nulls)** | — | {f'{vr.completeness_score:.1f} / 100' if vr else 'N/A'} | {'Measured' if vr else 'Not run'} |",
+        f"| **Validity (Types & Ranges)** | — | {f'{vr.validity_score:.1f} / 100' if vr else 'N/A'} | {'Measured' if vr else 'Not run'} |",
+        f"| **Uniqueness (Duplicates & Keys)** | — | {f'{vr.uniqueness_score:.1f} / 100' if vr else 'N/A'} | {'Measured' if vr else 'Not run'} |",
+        f"| **Consistency (Cross-field Rules)** | — | {f'{vr.consistency_score:.1f} / 100' if vr else 'N/A'} | {'Measured' if vr else 'Not run'} |",
+        f"| **Total Rows** | {rows_before} | {rows_after} | {row_delta:+,} rows |" if isinstance(row_delta, int) else f"| **Total Rows** | {rows_before} | {rows_after} | Not measured |",
+        f"| **Pandera Contract Conformance** | Input-anchored | **{pandera_status}** | Enforced |",
         "",
         "---",
         "",
         "## 2. Pandera Schema Contract Verification",
     ]
 
-    if vr and vr.pandera_failure_cases:
+    if vr is None:
+        lines.extend([
+            "⚠️ **Pandera contract validation was not run.**",
+            "",
+        ])
+    elif vr.pandera_failure_cases:
         lines.extend([
             f"⚠️ **Pandera Contract Failures Detected ({vr.pandera_failure_count} total violations):**",
             "",
@@ -82,12 +92,13 @@ def generate_report(
             count = fc.get("violation_count", 0)
             samples = ", ".join(str(s) for s in fc.get("sample_failures", []))
             lines.append(f"| `{col}` | `{check}` | {count} | `{samples}` |")
+    elif not vr.pandera_schema_passed:
+        lines.extend([
+            "⚠️ **Pandera contract validation failed; detailed failure cases were unavailable.**",
+        ])
     else:
         lines.extend([
-            "✅ **All Pandera schema constraints and domain bounds passed without violations.**",
-            "- Strict dtype enforcement: Verified",
-            "- Primary Key non-null and uniqueness constraints: Verified",
-            "- Regex format & domain boundary checks: Verified",
+            "✅ **All recorded Pandera schema constraints passed without violations.**",
         ])
 
     lines.extend([
@@ -140,8 +151,10 @@ def generate_report(
             sev_badge = f"**{flag.severity.upper()}**"
             col_str = f"`{flag.column}`" if flag.column else "*Dataset Global*"
             lines.append(f"| {sev_badge} | {col_str} | {flag.reason} |")
+    elif production_approved:
+        lines.append("✅ **No escalation flags raised.** All recorded validation and integrity checks passed.")
     else:
-        lines.append("✅ **No escalation flags raised.** Dataset is production-ready.")
+        lines.append("⚠️ **No specific escalation flag was recorded, but this run is not approved for production. Review the failed or missing validation evidence above.")
 
     lines.extend([
         "",
@@ -181,3 +194,12 @@ def generate_report(
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     with open(output_path, "w") as f:
         f.write(report_content)
+
+    if vr:
+        artifact_dir = Path(output_path).parent
+        stem = Path(output_path).stem.removeprefix("report_")
+        validation_path = artifact_dir / f"validation_{stem}.json"
+        validation_path.write_text(vr.model_dump_json(indent=2), encoding="utf-8")
+        if vr.great_expectations_suite is not None:
+            suite_path = artifact_dir / f"quality_suite_{stem}.json"
+            suite_path.write_text(json.dumps(vr.great_expectations_suite, indent=2), encoding="utf-8")

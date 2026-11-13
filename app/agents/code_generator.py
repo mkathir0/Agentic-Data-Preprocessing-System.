@@ -48,38 +48,15 @@ def extract_code_from_response(text: str) -> CodeGenerationOutput:
     raise ValueError(f"Could not extract Python code or JSON from response: {text[:200]}")
 
 def _generate_heuristic_code(plan: TransformationPlan = None) -> CodeGenerationOutput:
-    code_lines = [
-        "import pandas as pd",
-        "import numpy as np",
-        "",
-        "def clean_data(df: pd.DataFrame) -> pd.DataFrame:",
-        "    df = df.copy()",
-        "    # 1. Strip whitespace from all string columns",
-        "    for col in df.select_dtypes(include=['object', 'string']).columns:",
-        "        df[col] = df[col].astype(str).str.strip().replace({'nan': np.nan, 'None': np.nan, '': np.nan})",
-        "",
-        "    # 2. Drop exact duplicates",
-        "    df = df.drop_duplicates().reset_index(drop=True)",
-        "",
-        "    # 3. Numeric bounds & sentinel string cleansing",
-        "    for col in df.columns:",
-        "        if any(term in col.lower() for term in ['amount', 'price', 'salary', 'fee', 'subtotal', 'total', 'tax']):",
-        "            df[col] = pd.to_numeric(df[col].replace(['N/A', '-999', 'NULL', 'unknown'], np.nan), errors='coerce')",
-        "            df[col] = df[col].abs()",
-        "        elif 'age' in col.lower():",
-        "            df[col] = pd.to_numeric(df[col], errors='coerce').clip(0, 120)",
-        "",
-        "    # 4. Fill missing numeric values with column median",
-        "    for col in df.select_dtypes(include=[np.number]).columns:",
-        "        if df[col].isnull().any():",
-        "            df[col] = df[col].fillna(df[col].median())",
-        "",
-        "    return df"
-    ]
-    return CodeGenerationOutput(
-        code="\n".join(code_lines),
-        dependencies=["pandas", "numpy"]
-    )
+    actions = [a.model_dump() for a in plan.actions] if plan else []
+    # The sandbox cannot import the application package; embed the exact policy
+    # module so executor and validator share transformation semantics.
+    from pathlib import Path
+    from app.agents import cleaning_policy
+    source = Path(cleaning_policy.__file__).read_text(encoding="utf-8")
+    code = source
+    code += "\ndef clean_data(df):\n    return apply_cleaning_plan(df, " + repr(actions) + ")[0]\n"
+    return CodeGenerationOutput(code=code, dependencies=["pandas"])
 
 @traceable(name="Code Generator Agent (LLM)", run_type="chain")
 def generate_cleaning_code(plan: TransformationPlan, error_feedback: str = None, previous_code: str = None) -> CodeGenerationOutput:
@@ -116,7 +93,16 @@ def generate_cleaning_code(plan: TransformationPlan, error_feedback: str = None,
     """
     
     prompt += """
-    Your task is to write a standalone Python script that executes this plan.
+    Your task is to write a standalone Python script that executes the verifiable parts of this plan.
+    AUTOMATIC POLICY: Implement only these explicit, high-confidence actions using
+    exactly their stated semantics: strip_whitespace, whole-row drop_duplicates,
+    normalize_numeric_format, normalize_datetime_format, normalize_boolean, and
+    normalize_category_case. The deterministic application policy is embedded in
+    the code context; follow it exactly. Do not impute values, correct contradictory
+    business records, clip outliers, fuzzy-merge categories, change identifiers,
+    add rows, or drop columns. A flag_for_review or non-high-confidence action
+    protects that column from changes.
+    Validation compares complete output records against this policy.
     Assume the data is passed as a pandas DataFrame named `df`.
     You should write a function called `clean_data(df: pd.DataFrame) -> pd.DataFrame`
     that implements the actions described in the plan.

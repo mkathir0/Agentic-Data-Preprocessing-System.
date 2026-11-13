@@ -1,5 +1,6 @@
 import os
 import json
+import logging
 from typing import TypedDict, Optional, Dict, Any
 from langgraph.graph import StateGraph, END
 from langsmith import traceable
@@ -79,7 +80,13 @@ def node_plan(state: AgentState) -> dict:
     s_data = SchemaOutput.model_validate(state["schema_data"])
     user_instructions = state.get("user_instructions")
     
-    plan = generate_transformation_plan(p_data, q_data, s_data, user_instructions=user_instructions)
+    plan = generate_transformation_plan(
+        p_data,
+        q_data,
+        s_data,
+        user_instructions=user_instructions,
+        validation_feedback=state.get("error_feedback"),
+    )
     
     return {
         "plan_json": plan.model_dump_json()
@@ -116,7 +123,7 @@ def node_code(state: AgentState) -> dict:
     metadata={"agent_id": AGENT_ID, "environment": AGENT_ENV}
 )
 def node_execute(state: AgentState) -> dict:
-    """Safely executes the generated code in an isolated subprocess against the input dataset."""
+    """Executes generated code in an OS-restricted runtime against a fresh dataset copy."""
     code = state["current_code"]
     exec_result = execute_cleaning_code(code, state["input_file"], state["output_file"])
     
@@ -161,9 +168,14 @@ def node_validate(state: AgentState) -> dict:
     report_dict = report.model_dump()
     high_sev = [flag.model_dump() for flag in report.escalation_flags if flag.severity == "high"]
     has_pandera_errors = not report.pandera_schema_passed
+    # If the output exactly matches the permitted deterministic plan, the code
+    # did its job. Remaining contract/quality findings describe the input and
+    # require review or an explicit domain rule; retrying the same safe plan
+    # cannot repair them and risks asking the model to invent a mutation.
+    integrity_verified_candidate = report.integrity_passed
     
-    # If high severity violations or Pandera schema errors exist, trigger the circuit breaker
-    if not report.overall_passed and (high_sev or has_pandera_errors):
+    # Any failed validation must be repaired from evidence or escalated after bounded retries.
+    if not report.overall_passed and not integrity_verified_candidate:
         feedback_parts = []
         if has_pandera_errors and report.pandera_failure_cases:
             feedback_parts.append("PANDERA SCHEMA FAILURES:")
@@ -176,8 +188,26 @@ def node_validate(state: AgentState) -> dict:
             feedback_parts.append(f"REGRESSION: Cleaning code introduced new nulls: {report.new_nulls_introduced}")
         if report.key_conflict_count > 0:
             feedback_parts.append(f"PRIMARY KEY COLLISION: {report.key_conflict_count} rows violate PK uniqueness: {report.key_conflict_details}")
+        failed_checks = [c.name for c in report.regression_checks if not c.passed]
+        if failed_checks:
+            feedback_parts.append(f"INTEGRITY FAILURES: {failed_checks}. Preserve records and obey the supported plan rules.")
         if high_sev:
             feedback_parts.append(f"HIGH SEVERITY ANOMALIES: {[f['reason'] for f in high_sev]}")
+        if report.review_reasons:
+            feedback_parts.append("HUMAN REVIEW FINDINGS: " + "; ".join(report.review_reasons[:12]))
+        failed_quality_checks = [
+            f"{check.name}: {check.details}"
+            for check in (
+                report.schema_checks + report.range_checks + report.cross_field_checks
+                + report.distributional_checks + report.duplicate_checks + report.format_checks
+                + report.regression_checks
+            )
+            if not check.passed
+        ]
+        if failed_quality_checks:
+            feedback_parts.append("QUALITY FINDINGS REQUIRING REVIEW OR A GROUNDED FIX: " + "; ".join(failed_quality_checks[:12]))
+        if not feedback_parts:
+            feedback_parts.append("Validation did not pass. Recheck the plan against the original deterministic evidence and preserve ambiguous values for review.")
             
         formatted_feedback = "\n".join(feedback_parts)
         if len(formatted_feedback) > 2000:
@@ -188,14 +218,18 @@ def node_validate(state: AgentState) -> dict:
             "retry_count": state["retry_count"] + 1,
             "quality_summary": f"Validation failed with {len(report.escalation_flags)} issues (Pandera passed: {report.pandera_schema_passed}).",
             "validation_report": report_dict,
-            "quality_after": {"is_valid": False, "summary": "Validation failed", "anomalies": high_sev}
+            "quality_after": {"is_valid": False, "summary": "Validation failed; review required if unresolved", "anomalies": [f.model_dump() for f in report.escalation_flags]}
         }
         
     return {
         "error_feedback": None,
-        "quality_summary": f"Passed {report.total_passed}/{report.total_checks} checks (Quality Score: {report.data_quality_score_after:.1f}/100, +{report.score_improvement:.1f}%).",
+        "quality_summary": ("Human review required. " if not report.overall_passed else "") + f"Passed {report.total_passed}/{report.total_checks} checks (Quality Score: {report.data_quality_score_after:.1f}/100, +{report.score_improvement:.1f}%).",
         "validation_report": report_dict,
-        "quality_after": {"is_valid": report.overall_passed, "summary": "Full validation complete", "anomalies": []}
+        "quality_after": {
+            "is_valid": report.overall_passed,
+            "summary": "Full validation complete" if report.overall_passed else "Validation complete; human review required",
+            "anomalies": [] if report.overall_passed else [f.model_dump() for f in report.escalation_flags],
+        }
     }
 
 
@@ -208,10 +242,12 @@ def node_validate(state: AgentState) -> dict:
 )
 def node_report(state: AgentState) -> dict:
     """Generates the final comprehensive Markdown engineering and quality report."""
-    if state.get("error_feedback") and state["retry_count"] >= 3:
-        status = "FAILED"
-    else:
-        status = "COMPLETED"
+    validation = state.get("validation_report") or {}
+    status = "COMPLETED" if (
+        not state.get("error_feedback")
+        and validation.get("overall_passed") is True
+        and validation.get("integrity_passed") is True
+    ) else "FAILED"
         
     generate_report(
         job_id=state["job_id"],
@@ -237,7 +273,7 @@ def route_after_validation(state: AgentState):
     if state.get("error_feedback"):
         if state["retry_count"] >= 3:
             return "report"
-        return "code"
+        return "plan"
     return "report"
 
 
@@ -276,7 +312,7 @@ def build_graph():
         "validate",
         route_after_validation,
         {
-            "code": "code",
+            "plan": "plan",
             "report": "report"
         }
     )
@@ -298,7 +334,7 @@ def build_graph():
         "project": os.environ.get("LANGSMITH_PROJECT", "agentic-data-preprocessing-pipeline"),
     }
 )
-def run_pipeline(
+def _run_pipeline(
     job_id: str,
     input_file: str,
     output_file: str,
@@ -337,3 +373,31 @@ def run_pipeline(
         "quality_summary": result.get("quality_summary"),
         "current_code": result.get("current_code"),
     }
+
+
+def run_pipeline(
+    job_id: str,
+    input_file: str,
+    output_file: str,
+    report_file: str,
+    user_instructions: Optional[str] = None,
+) -> dict:
+    # Flush outside the decorated call: its root completion update is queued
+    # only after _run_pipeline returns (or raises).
+    from langsmith.run_trees import get_cached_client
+
+    client = get_cached_client()
+    try:
+        return _run_pipeline(
+            job_id=job_id,
+            input_file=input_file,
+            output_file=output_file,
+            report_file=report_file,
+            user_instructions=user_instructions,
+            langsmith_extra={"client": client, "metadata": {"job_id": job_id}},
+        )
+    finally:
+        try:
+            client.flush(timeout=15)
+        except Exception:
+            logging.getLogger(__name__).exception("Could not flush LangSmith traces for job %s", job_id)

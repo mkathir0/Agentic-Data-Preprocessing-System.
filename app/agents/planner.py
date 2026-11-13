@@ -35,6 +35,10 @@ def _generate_heuristic_plan(
     quality_data: QualityOutput,
     schema_data: SchemaOutput
 ) -> TransformationPlan:
+    # Keep the automatic plan limited to reversible, explicitly allowlisted
+    # operations. Quality findings belong in the validation report; turning
+    # each finding into a global review action blocks unrelated safe formatting
+    # cleanup and whole-row exact deduplication.
     actions = [
         TransformationAction(
             column=None,
@@ -51,35 +55,12 @@ def _generate_heuristic_plan(
             estimated_rows_affected_pct=profiler_data.duplicate_rows_percentage
         )
     ]
-    for anom in quality_data.anomalies:
-        if anom.anomaly_type == "missing_values" and anom.column:
-            actions.append(TransformationAction(
-                column=anom.column,
-                action_type="fill_missing_median" if profiler_data.column_types.get(anom.column) == "Numeric" else "fill_missing_mode",
-                explanation=f"Address missing values in '{anom.column}'.",
-                confidence="medium",
-                estimated_rows_affected_pct=anom.affected_percentage or 0.05
-            ))
-        elif anom.anomaly_type == "range_bound_violation" and anom.column:
-            actions.append(TransformationAction(
-                column=anom.column,
-                action_type="clip_or_filter_bounds",
-                explanation=f"Normalize out-of-bounds domain values in '{anom.column}'.",
-                confidence="high",
-                estimated_rows_affected_pct=anom.affected_percentage or 0.02
-            ))
-        elif anom.anomaly_type == "cross_field_violation":
-            actions.append(TransformationAction(
-                column=None,
-                action_type="reconcile_cross_field",
-                explanation="Reconcile temporal order and arithmetic identity violations.",
-                confidence="high",
-                estimated_rows_affected_pct=0.02
-            ))
+    for candidate in profiler_data.candidate_transformations:
+        actions.append(TransformationAction.model_validate(candidate))
     return TransformationPlan(
-        dataset_summary=f"Automated transformation plan addressing {len(quality_data.anomalies)} anomalies across {profiler_data.num_columns} columns.",
+        dataset_summary=f"Applied evidence-backed representation normalization and exact duplicate handling to a {profiler_data.num_rows}-row, {profiler_data.num_columns}-column dataset; ambiguous quality findings remain for review.",
         actions=actions,
-        global_assumptions=["Dataset cleaned using deterministic domain heuristics."]
+        global_assumptions=["Ambiguous anomalies are preserved and reported; no business corrections are inferred."]
     )
 
 @traceable(name="Planner Agent (LLM)", run_type="chain")
@@ -87,7 +68,8 @@ def generate_transformation_plan(
     profiler_data: ProfilerOutput,
     quality_data: QualityOutput,
     schema_data: SchemaOutput,
-    user_instructions: str = None
+    user_instructions: str = None,
+    validation_feedback: str = None,
 ) -> TransformationPlan:
     """
     Uses an LLM to read the deterministic profiling data and output a structured cleaning plan.
@@ -115,6 +97,7 @@ def generate_transformation_plan(
         n_miss = c_sum.get("n_missing", 0)
         lines_p.append(f"  - {col} ({ctype}): {n_miss} nulls")
     condensed_profiler = "\n".join(lines_p)
+    candidate_actions = json.dumps(profiler_data.candidate_transformations, ensure_ascii=False)
 
     lines_q = [f"Summary: {quality_data.summary}", "Detected Anomalies:"]
     for a in quality_data.anomalies:
@@ -137,6 +120,16 @@ def generate_transformation_plan(
     You MUST honor and incorporate these user-specified instructions into the transformation actions.
 """
 
+    feedback_block = ""
+    if validation_feedback and validation_feedback.strip():
+        feedback_block = f"""
+    --- Previous validation feedback ---
+    {validation_feedback.strip()}
+    Reconsider the previous plan using this evidence. Only propose changes supported
+    by the data and a reviewed domain rule. If the issue is ambiguous or cannot be
+    fixed safely, mark it for human review and preserve the original values.
+"""
+
     prompt = f"""
     You are an expert Data Engineer. You have been provided with deterministic data profiling,
     quality, and schema information for a messy dataset.
@@ -152,12 +145,24 @@ def generate_transformation_plan(
 
     --- Schema Inference ---
     {condensed_schema}
+{feedback_block}
 
     CRITICAL INSTRUCTIONS FOR ANOMALIES:
-    You MUST propose a fix for ALL anomalies reported in the Quality Data. Do not ignore them!
+    Account for every anomaly, but do not assume that every anomaly should be changed.
+    Propose an automatic fix only when the evidence and a reviewed domain rule support it;
+    otherwise use 'flag_for_review' and preserve the source values.
+    The profiler supplied these deterministic safe-format candidates: {candidate_actions}
+    You may include these candidates, but do not invent normalization parameters or a category mapping that is not in the profile evidence.
+    The executable allowlist is strip_whitespace, whole-row drop_duplicates, normalize_numeric_format,
+    normalize_datetime_format, normalize_boolean, and normalize_category_case. Unsupported actions
+    are preserved and reported for review.
     - For whitespace/format issues (e.g. leading/trailing spaces), propose a 'strip_whitespace' action (confidence: high). 
-    - **IMPORTANT ORDERING**: You MUST apply whitespace stripping and formatting fixes BEFORE dropping exact duplicates. Trailing spaces can hide exact duplicates, so deduping must happen after whitespace fixes!
-    - For cross-field business rule violations (e.g. ended_at < started_at) or range bounds (e.g. speed > 200), you MUST propose an action to fix them. If you can confidently fix them (e.g. 'drop_invalid_rows', 'swap_dates'), do so. If you cannot confidently fix them, you MUST propose a 'flag_for_review' action so they are explicitly escalated to a human.
+    - **IMPORTANT ORDERING**: Apply an explicitly approved whitespace trim before whole-row exact duplicate removal. Do not remove rows based on a subset key.
+    - Normalize a date only when the profiler has supplied a non-ambiguous date_order in a safe candidate.
+    - Normalize numeric strings only when all non-missing values are parseable and sentinels are explicit.
+    - Normalize boolean tokens only when every non-missing token is recognized.
+    - Normalize categories only for values differing by case; do not fuzzy-merge aliases, names, or misspellings.
+    - For missing values, outliers, range violations, or contradictory cross-field rules, use 'flag_for_review' unless the supplied evidence includes a verified domain rule authorizing that exact transformation.
 
     For EACH action you plan, you MUST provide:
     1. `action_type`: The transformation (e.g. 'drop_duplicates', 'fill_missing_median', 'cast_to_datetime', 'drop_column'). 
