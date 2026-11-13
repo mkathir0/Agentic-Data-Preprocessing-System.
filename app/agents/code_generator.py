@@ -10,7 +10,42 @@ def generate_cleaning_code(plan: TransformationPlan, error_feedback: str = None,
     Can also take error_feedback and previous_code to fix mistakes.
     """
     settings = get_settings()
-    
+
+    # Graceful fallback if no GROQ_API_KEY is configured
+    if not settings.GROQ_API_KEY:
+        code_lines = [
+            "import pandas as pd",
+            "import numpy as np",
+            "",
+            "def clean_data(df: pd.DataFrame) -> pd.DataFrame:",
+            "    df = df.copy()",
+            "    # 1. Strip whitespace from all string columns",
+            "    for col in df.select_dtypes(include=['object', 'string']).columns:",
+            "        df[col] = df[col].astype(str).str.strip().replace({'nan': np.nan, 'None': np.nan})",
+            "",
+            "    # 2. Drop exact duplicates",
+            "    df = df.drop_duplicates().reset_index(drop=True)",
+            "",
+            "    # 3. Numeric bounds & sentinel string cleansing",
+            "    for col in df.columns:",
+            "        if any(term in col.lower() for term in ['amount', 'price', 'salary', 'fee', 'subtotal', 'total']):",
+            "            df[col] = pd.to_numeric(df[col].replace(['N/A', '-999', 'NULL', 'unknown'], np.nan), errors='coerce')",
+            "            df[col] = df[col].abs()",
+            "        elif 'age' in col.lower():",
+            "            df[col] = pd.to_numeric(df[col], errors='coerce').clip(0, 120)",
+            "",
+            "    # 4. Fill missing numeric values with column median",
+            "    for col in df.select_dtypes(include=[np.number]).columns:",
+            "        if df[col].isnull().any():",
+            "            df[col] = df[col].fillna(df[col].median())",
+            "",
+            "    return df"
+        ]
+        return CodeGenerationOutput(
+            code="\n".join(code_lines),
+            dependencies=["pandas", "numpy"]
+        )
+
     # Extract the model name if it starts with groq/
     model_name = settings.LLM_MODEL.replace("groq/", "") if settings.LLM_MODEL.startswith("groq/") else settings.LLM_MODEL
     

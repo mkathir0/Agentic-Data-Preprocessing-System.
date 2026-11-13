@@ -21,6 +21,56 @@ def generate_transformation_plan(
     """
     settings = get_settings()
 
+    # Graceful fallback if no GROQ_API_KEY is configured
+    if not settings.GROQ_API_KEY:
+        from app.agents.schemas import TransformationAction
+        actions = [
+            TransformationAction(
+                column=None,
+                action_type="strip_whitespace",
+                explanation="Trim untrimmed whitespace from string columns to prevent hidden duplicate keys.",
+                confidence="high",
+                estimated_rows_affected_pct=0.05
+            ),
+            TransformationAction(
+                column=None,
+                action_type="drop_duplicates",
+                explanation=f"Drop {profiler_data.duplicate_rows} exact duplicate rows.",
+                confidence="high",
+                estimated_rows_affected_pct=profiler_data.duplicate_rows_percentage
+            )
+        ]
+        for anom in quality_data.anomalies:
+            if anom.anomaly_type == "missing_values" and anom.column:
+                actions.append(TransformationAction(
+                    column=anom.column,
+                    action_type="fill_missing_median" if profiler_data.column_types.get(anom.column) == "Numeric" else "fill_missing_mode",
+                    explanation=f"Address missing values in '{anom.column}'.",
+                    confidence="medium",
+                    estimated_rows_affected_pct=anom.affected_percentage or 0.05
+                ))
+            elif anom.anomaly_type == "range_bound_violation" and anom.column:
+                actions.append(TransformationAction(
+                    column=anom.column,
+                    action_type="clip_or_filter_bounds",
+                    explanation=f"Normalize out-of-bounds domain values in '{anom.column}'.",
+                    confidence="high",
+                    estimated_rows_affected_pct=anom.affected_percentage or 0.02
+                ))
+            elif anom.anomaly_type == "cross_field_violation":
+                actions.append(TransformationAction(
+                    column=None,
+                    action_type="reconcile_cross_field",
+                    explanation="Reconcile temporal order and arithmetic identity violations.",
+                    confidence="high",
+                    estimated_rows_affected_pct=0.02
+                ))
+        return TransformationPlan(
+            dataset_summary=f"Automated transformation plan addressing {len(quality_data.anomalies)} anomalies across {profiler_data.num_columns} columns.",
+            actions=actions,
+            global_assumptions=["Dataset cleaned using deterministic domain heuristics."]
+        )
+
     model_name = settings.LLM_MODEL.replace("groq/", "") if settings.LLM_MODEL.startswith("groq/") else settings.LLM_MODEL
 
     llm = ChatGroq(model=model_name, temperature=0, api_key=settings.GROQ_API_KEY)
