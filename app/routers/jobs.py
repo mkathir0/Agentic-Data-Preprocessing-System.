@@ -457,9 +457,8 @@ async def get_langsmith_traces(job_id: str, db: Session = Depends(get_db)):
     project_name = os.environ.get("LANGSMITH_PROJECT", "agentic-data-preprocessing-pipeline")
 
     try:
-        from langsmith import Client
-        client = Client(api_url=endpoint, api_key=api_key)
-        runs = list(client.list_runs(project_name=project_name, limit=35))
+        from app.langsmith_queries import fetch_job_runs
+        runs = await fetch_job_runs(job_id, job.created_at, endpoint, api_key, project_name)
         if not runs:
             return _build_local_agent_traces(job)
 

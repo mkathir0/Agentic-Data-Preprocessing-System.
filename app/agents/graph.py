@@ -288,6 +288,7 @@ def build_graph():
 
 @traceable(
     name="Data Preprocessing Pipeline",
+    project_name=os.environ.get("LANGSMITH_PROJECT", "agentic-data-preprocessing-pipeline"),
     run_type="chain",
     tags=[AGENT_ID, AGENT_ENV, "root-pipeline"],
     metadata={
