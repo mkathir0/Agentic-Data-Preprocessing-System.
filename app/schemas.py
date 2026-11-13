@@ -20,6 +20,7 @@ class JobResponse(JobBase):
     error_message: Optional[str] = None
     progress: float
     current_step: Optional[str] = None
+    retry_count: Optional[float] = 0.0
     
     original_filepath: Optional[str] = None
     cleaned_filepath: Optional[str] = None
