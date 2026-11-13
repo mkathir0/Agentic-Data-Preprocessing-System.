@@ -178,3 +178,7 @@ class ValidationReport(BaseModel):
     key_conflict_count: int = 0
     key_conflict_details: List[str] = Field(default_factory=list)
     circuit_breaker_retries: int = 0
+    exact_duplicates_removed: int = 0
+
+    # Interoperability Suites
+    great_expectations_suite: Optional[Dict[str, Any]] = None

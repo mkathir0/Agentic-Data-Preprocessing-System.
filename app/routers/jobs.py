@@ -95,17 +95,29 @@ def process_job(job_id: str, db: Session):
                 except Exception:
                     pass
 
-            if final_status == "FAILED":
+            has_valid_output = os.path.exists(output_file) and os.path.getsize(output_file) > 0
+            if has_valid_output:
+                job.status = "COMPLETED"
+                job.progress = 100.0
+                job.error_message = None
+                job.cleaned_filepath = output_file
+                if os.path.exists(report_file):
+                    job.profile_report_path = report_file
+                if final_status == "FAILED":
+                    job.current_step = "REVIEW_FLAGGED"
+                else:
+                    job.current_step = "COMPLETED"
+            elif final_status == "FAILED":
                 job.status = "FAILED"
                 job.progress = 100.0
                 job.error_message = "Validation or execution failed after max retries."
-                if os.path.exists(output_file):
-                    job.cleaned_filepath = output_file
             else:
                 job.status = "COMPLETED"
                 job.progress = 100.0
                 job.error_message = None
                 job.cleaned_filepath = output_file
+                if os.path.exists(report_file):
+                    job.profile_report_path = report_file
             db.commit()
             
     except Exception as e:
@@ -259,6 +271,8 @@ def map_run_to_agent_name(name: str) -> str:
         return "LLM (Groq)"
     elif "schema" in name_lower:
         return "SchemaAgent"
+    elif "validation" in name_lower or "validate" in name_lower:
+        return "ValidationEngine"
     elif "data preprocessing pipeline" in name_lower or "pipeline" in name_lower:
         return "Pipeline"
     return name
@@ -441,83 +455,37 @@ async def get_langsmith_traces(job_id: str, db: Session = Depends(get_db)):
 
     endpoint = os.environ.get("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com").rstrip("/")
     project_name = os.environ.get("LANGSMITH_PROJECT", "agentic-data-preprocessing-pipeline")
-    headers = {"x-api-key": api_key}
-    params = {
-        "project_name": project_name,
-        "run_type": "chain",
-        "limit": 50,
-        "is_root": "true"
-    }
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(f"{endpoint}/api/v1/runs", headers=headers, params=params)
-            if resp.status_code != 200:
-                return _build_local_agent_traces(job)
+        from langsmith import Client
+        client = Client(api_url=endpoint, api_key=api_key)
+        runs = list(client.list_runs(project_name=project_name, limit=35))
+        if not runs:
+            return _build_local_agent_traces(job)
 
-            runs_data = resp.json()
-            runs = runs_data if isinstance(runs_data, list) else runs_data.get("runs", [])
+        events = []
+        for r in runs:
+            agent_name = map_run_to_agent_name(r.name or "")
+            dur_ms = int((r.end_time - r.start_time).total_seconds() * 1000) if (r.end_time and r.start_time) else 0
+            if r.error:
+                msg = f"Error in {agent_name}: {r.error}"
+                level = "error"
+            else:
+                msg = f"{agent_name} executed in {dur_ms}ms"
+                level = "info"
 
-            matching_runs = [r for r in runs if r.get("name") == "Data Preprocessing Pipeline"]
-            if not matching_runs:
-                return _build_local_agent_traces(job)
-
-            # Match target root run for this job_id, or pick the most recent root run
-            target_run = None
-            for r in matching_runs:
-                r_inputs = r.get("inputs") or {}
-                if str(r_inputs.get("job_id")) == str(job_id):
-                    target_run = r
-                    break
-
-            if not target_run:
-                target_run = matching_runs[0]
-
-            target_run_id = target_run.get("id")
-
-            # Fetch child runs
-            child_resp = await client.get(
-                f"{endpoint}/api/v1/runs",
-                headers=headers,
-                params={"parent_run": target_run_id}
-            )
-
-            child_runs = []
-            if child_resp.status_code == 200:
-                c_data = child_resp.json()
-                child_runs = c_data if isinstance(c_data, list) else c_data.get("runs", [])
-
-            all_runs = [target_run] + child_runs
-
-            events = []
-            for r in all_runs:
-                name = r.get("name", "")
-                agent_name = map_run_to_agent_name(name)
-                dur_ms = calculate_duration_ms(r)
-                msg = build_run_message(agent_name, r, dur_ms)
-
-                err = r.get("error")
-                if err or r.get("status") == "error":
-                    level = "error"
-                elif r.get("extra", {}).get("retry"):
-                    level = "warning"
-                else:
-                    level = "info"
-
-                events.append({
-                    "id": str(r.get("id", "")),
-                    "agent": agent_name,
-                    "level": level,
-                    "message": msg,
-                    "timestamp": str(r.get("start_time") or r.get("created_at") or ""),
-                    "duration_ms": dur_ms,
-                    "tags": r.get("tags") or [],
-                    "inputs": r.get("inputs") or {},
-                    "outputs": r.get("outputs") or {}
-                })
-
-            return events
-
+            events.append({
+                "id": str(r.id),
+                "agent": agent_name,
+                "level": level,
+                "message": msg,
+                "timestamp": r.start_time.isoformat() if r.start_time else "",
+                "duration_ms": dur_ms,
+                "tags": r.tags or [],
+                "inputs": r.inputs or {},
+                "outputs": r.outputs or {}
+            })
+        return events
     except Exception:
         return _build_local_agent_traces(job)
 

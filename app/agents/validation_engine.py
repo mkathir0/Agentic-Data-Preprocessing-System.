@@ -15,6 +15,7 @@ import re
 import math
 import difflib
 import logging
+from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple, Set
 
 import pandas as pd
@@ -99,20 +100,21 @@ def _col_stats(df: pd.DataFrame, col: str) -> ColumnStats:
 
 def build_dynamic_pandera_schema(
     df: pd.DataFrame,
-    schema_info: Optional[SchemaOutput] = None
+    schema_info: Optional[SchemaOutput] = None,
+    pks_override: Optional[List[str]] = None
 ) -> pa.DataFrameSchema:
     """
     Synthesizes a Pandera DataFrameSchema dynamically from the inferred schema
     and domain heuristics.
     """
     columns: Dict[str, pa.Column] = {}
-    pks = schema_info.primary_keys if schema_info and schema_info.primary_keys else []
+    pks = list(pks_override) if pks_override is not None else (list(schema_info.primary_keys) if schema_info and schema_info.primary_keys else [])
 
     # Detect fallback PKs if not provided
     if not pks:
         for col in df.columns:
             if re.search(r'\bid\b|_id$|uuid', col, re.I):
-                if df[col].nunique() / max(len(df), 1) > 0.95:
+                if df[col].nunique() / max(len(df), 1) > 0.90:
                     pks.append(col)
 
     for col in df.columns:
@@ -628,8 +630,16 @@ def execute_full_validation_engine(
         columns_added=[c for c in df_after.columns if c not in df_before.columns],
     )
 
+    # Detect candidate primary keys consistently across Pandera and collision checks
+    pks = list(schema.primary_keys) if (schema and schema.primary_keys) else []
+    if not pks:
+        for col in df_after.columns:
+            if re.search(r'\bid\b|_id$|uuid', col, re.I):
+                if df_after[col].nunique() / max(len(df_after), 1) > 0.90:
+                    pks.append(col)
+
     # ── Category 1: Schema & Pandera Contract ──
-    pandera_schema = build_dynamic_pandera_schema(df_after, schema)
+    pandera_schema = build_dynamic_pandera_schema(df_after, schema, pks_override=pks)
     pandera_passed, pandera_failures, pandera_feedback, pandera_checks = validate_pandera_contract(df_after, pandera_schema)
     report.pandera_schema_passed = pandera_passed
     report.pandera_failure_count = sum(f['violation_count'] for f in pandera_failures)
@@ -723,7 +733,6 @@ def execute_full_validation_engine(
     report.stats_diff = diffs
 
     # ── Category 5: Duplicates, Key Conflicts, & Fuzzy Near-Duplicates ──
-    pks = schema.primary_keys if schema and schema.primary_keys else []
     exact_dups, key_confs, conf_details, dup_checks = detect_key_conflicts(df_after, pks)
     fuzzy_clusters, fuzzy_examples, fuzzy_checks = detect_fuzzy_duplicates(df_after)
 
@@ -909,6 +918,17 @@ def execute_full_validation_engine(
             reason=f"Pipeline introduced {count} new null values in '{col}'",
             severity="high"
         ))
+
+    report.exact_duplicates_removed = max(0, len(df_before) - len(df_after))
+
+    # ── Category 7: Great Expectations Suite Generation ──
+    try:
+        report.great_expectations_suite = export_great_expectations_suite(
+            pandera_schema,
+            suite_name=f"quality_suite_{Path(output_path).stem}"
+        )
+    except Exception as e:
+        logger.warning(f"Failed to export Great Expectations suite: {e}")
 
     report.escalation_flags = flags
 
